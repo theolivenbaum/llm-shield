@@ -21,14 +21,16 @@ is the licence it is carried under.
 src/LlmShield.Shieldstral/
   Gguf/            GgmlType.cs (block geometry), GgufFile.cs (mmap reader)
   Quantization/    Dequantizer.cs (every GGML type), QuantGrids.g.cs (generated)
-  Numerics/        Kernels.cs, QuantMatMul.cs, WeightMatrix.cs
+  Numerics/        Kernels.cs, QuantMatMul.cs, PanelGemm.cs, AttentionKernels.cs, WeightMatrix.cs
   Tokenization/    TekkenTokenizer.cs
   Model/           ModelConfig.cs, Rope.cs, KvCache.cs, MinistralModel.cs
-  ChatTemplate.cs, SystemPromptCache.cs, ShieldstralModerator.cs, ModelDownloader.cs
+  ChatTemplate.cs, SystemPromptCache.cs, ShieldstralModerator.cs, ShieldstralDecider.cs,
+  ModelDownloader.cs
 src/LlmShield.Shieldstral.Cli/    the `shieldstral` command
 tests/LlmShield.Shieldstral.Tests/
 tests/fixtures/                   generated oracles (JSON), committed
 tools/                            Python: conversion, reference impl, fixtures
+tools/decision/                   PyTorch research path: typed decisions, JevBench eval, LoRA
 ```
 
 Dependency direction is one way: `Gguf` → `Quantization` → `Numerics` →
@@ -89,6 +91,26 @@ loader can detect. models.curiosity.ai answers HEAD with 405, so the size, the
 tag and range support all come from a one-byte ranged GET; drop that fallback and
 nothing fails, downloads just silently stop resuming.
 → `ModelDownloaderTests`, against a loopback socket rather than the real host
+
+**A token's result must not depend on the batch around it.** The prefix cache and
+the branched forward are only pure optimisations because every kernel computes a
+token's output with the same operation sequence whether the call has 5 tokens or
+500. `PanelGemm` runs one FMA chain per output over k in ascending order, in the
+6-token tile and in the 1-token tail alike. The attention kernels run one fused
+chain per (query, key), including the scalar tail (`MathF.FusedMultiplyAdd`, not
+`a += x * y`). Softmax runs over exactly the keys a query may see, never over a
+padded row. Break any of these and the prefix cache stops being bit-identical:
+nothing fails loudly, the tests below just stop passing.
+→ `PanelGemmTests.ATokensResultDoesNotDependOnItsBatch`,
+`AttentionKernelTests.AKeysScoreDoesNotDependOnWhereItsRangeStarts`,
+`DeciderTests.BranchesMatchRunningEachContinuationAlone`
+
+**Branches restart RoPE at the end of the shared part.** `ForwardTreeAsync` runs a
+causal trunk and then N branches in one pass. Branch tokens are written to
+consecutive cache slots, but each branch's positions start again where the trunk
+ends. Each branch attends to the trunk and to itself, never to a sibling. The slot
+is not the position; confusing them gives every option after the first a shifted
+rotation.
 
 **Softmax subtracts the maximum; `TensorPrimitives.SoftMax` does not.** That one
 evaluates `exp(x) / Σexp(x)` directly. Attention scores here reach the 90s in the
@@ -201,47 +223,73 @@ so no accumulation can be reordered.
 
 ## Performance notes
 
-The hot loop is `QuantMatMul.ForwardAsync`. Its shape is deliberate: weights dominate
-both the memory traffic and the decode cost, so each weight row is touched once
-per call and, in the float path, decoded into an L1-resident scratch buffer while
-every token in the current tile dots against it. Tiling the tokens
-(`TokenTileBytes`) is what keeps a long prompt from re-streaming the activations
-once per output row. Changing the loop order will usually make it slower; measure
-with `shieldstral bench`.
+A prompt of more than one token goes through `PanelGemm`, a register-tiled GEMM. The
+structure is laya's `PackedMatrix` (see that repository's CLAUDE.md for the tile sweep):
+- A worker takes 64 output rows and decodes them for one 2048-column K block.
+- The block is transposed into a `[k][64]` panel (512 KiB, resident in L2) with in-register
+  16×16 transposes.
+- The panel is streamed against the tokens six at a time, with 24 `Vector512` accumulators
+  live.
 
-There are two arithmetic paths, selected by `QuantMatMul.Strategy`:
+Single-threaded on the 4-core Sapphire Rapids VM, 3072×3072:
 
-- **Float** decodes each weight to float32 and uses `TensorPrimitives.Dot`. Works
-  for every one of the thirty-odd types.
-- **Integer** quantizes the activations to Q8_0 and multiplies in 8 bits. Only
-  for types with a single scale (plus optional offset) per 32-weight block —
-  `IntegerDot.Supports` is the predicate. The k-quants and i-quants carry
-  per-sub-block scales and stay on the float path.
+| tokens | row-wise dot (before) | panel GEMM | int8 row-wise |
+|---|---|---|---|
+| 8 | 21 | 24 GFLOP/s | 10 |
+| 64 | 28 | 83–91 | 16–22 |
+| 256 | 15–18 | 120–129 | 15–25 |
 
-`Auto` picks integer where there is a kernel. Three details in that kernel are
-load-bearing, and each was worth a measurable amount when it was missing:
+The old loop did one `TensorPrimitives.Dot` per (row, token): two loads per FMA, a horizontal
+reduction per output, and an activation slab too big for L2, re-streamed from L3 for every
+weight row. With the panel GEMM, end-to-end prefill on 4 threads went from 8 to about 64
+tokens/s.
 
-1. **Unpack once per row, dot once per (row, token).** Unpacking nibbles is per
-   *weight* work. Fusing it into the dot makes a 64-token prefill unpack the same
-   row 64 times, which is enough on its own to lose to the float path.
-2. **One horizontal reduction per row, not per block.** Accumulate into a
-   `Vector256<float>` across blocks. A shuffle chain every 32 weights costs about
-   as much as the multiply it is reducing.
-3. **`vpmaddubsw` + `vpmaddwd`** (`Avx2.MultiplyAddAdjacent`) do 32 8-bit MACs in
-   two instructions. Widening to 16 and then 32 bits by hand costs as much as
-   just doing float FMAs, so without these the integer path has no advantage at
-   all on AVX2. The first operand must be unsigned, hence the `|w| · sign(w)·a`
-   trick — and that is also why activations clamp to ±127, so every pairwise sum
-   stays inside int16.
+Measured and kept:
+- **Scalar scatter into the panel was as slow as the multiply at 64 tokens.** Every store hit a
+  different cache line. The 16×16 unpack/shuffle transpose fixed it (Q5_1 at 64 tokens: 30 → 51,
+  then 83 with vector dequant).
+- **The dequantizers for Q4_0, Q4_1, Q5_0, Q5_1 and Q8_0 are vectorised under AVX-512.** Every
+  prefill decodes every weight once, at about a nanosecond per weight in scalar code. They keep
+  the scalar multiply-then-add, so `DequantizerParityTests` still holds them byte-for-byte.
+- **With vector dequant, float beats int8 even at one token** for everything but Q8_0 (Q5_1:
+  7.6 vs 2.4 GFLOP/s). `Auto` follows that. The int8 path remains for Q8_0, for hardware without
+  AVX-512, and for `Strategy = Integer`.
+- **Only the verdict rows of the LM head are evaluated** (`ForwardSelectedAsync`). The full
+  131072-row head cost more than a short suffix's whole pass.
+- **Attention keys are transposed once per head.** A score vector then ends in a store, not a
+  shuffle chain. Queries are taken four at a time for scores and two at a time for the weighted
+  sum. Beyond about 2k tokens the transposed keys and the values outgrow L2, and one query at a
+  time re-streamed them from L3 for every query: a 4k-token decision went from 126 to 93 s.
 
-Q8_0 skips the unpack entirely (`DotPackedQ8_0`) since its payload is already
-plain int8.
+The decode path (one token) is still row-wise: it is bound by streaming the weights, and the
+panel transpose would cost more than it saves.
 
-The cost is accuracy: quantizing activations adds about 3e-3 of relative L2 error
-per matmul. That is well inside the tolerance the model-level tests use, and
-`IntegerDotTests` bounds both the noise and — separately and much more tightly —
-any systematic bias, since an unpacking error shows up as a shift rather than as
-noise.
+`QuantMatMul.Strategy = Integer` keeps the int8 kernels reachable for tests and benchmarks.
+Three details in them are load-bearing:
+
+1. **Unpack once per row, dot once per (row, token).** Unpacking nibbles is per *weight* work.
+   Fused into the dot, a 64-token prefill unpacks the same row 64 times.
+2. **One horizontal reduction per row, not per block.**
+3. **`vpmaddubsw` + `vpmaddwd`** (`Avx2.MultiplyAddAdjacent`) do 32 8-bit MACs in two
+   instructions. The first operand must be unsigned, hence the `|w| · sign(w)·a` trick. That is
+   also why activations clamp to ±127, so every pairwise sum stays inside int16.
+
+Quantizing activations adds about 3e-3 of relative L2 error per matmul; `IntegerDotTests`
+bounds both the noise and any systematic bias.
+
+## Typed decisions
+
+`ShieldstralDecider` answers the Jev / laya / djev typed questions (noul, choice, score) with
+Shieldstral's own yes/no verdict. It makes one read per option, "is option X the correct
+answer?", and runs a softmax over the per-option log-odds. A noul is read as a two-option
+choice between its false and true criteria. Asking it directly leaves a topical yes-bias
+(easy-tier fact accuracy: 0.58 direct, 0.92 as a contrast).
+
+The prefix is the instruction plus the document. Each option's query is a branch of one
+`ForwardTreeAsync` pass, so a decision costs one pass whatever the number of options. The
+prompt must match `tools/decision/decision_prompts.py` byte for byte: that is where adapters
+are trained (`tools/decision/README.md`), and a LoRA is only valid for its prompt.
+→ `DeciderTests.PrefixAndSuffixRenderTheTrainedPrompt`
 
 ## Releasing
 

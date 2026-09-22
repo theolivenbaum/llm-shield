@@ -43,6 +43,13 @@ public static class QuantMatMul
     /// <summary>Bytes of activations to keep resident per tile — sized for a typical L3.</summary>
     private const int TokenTileBytes = 4 * 1024 * 1024;
 
+    /// <summary>
+    /// Token count from which <see cref="PanelGemm"/> takes the product. Below it the call is
+    /// bound by streaming the weights, and the row-wise paths, which skip the panel transpose,
+    /// are faster.
+    /// </summary>
+    public static int PanelMinTokens { get; set; } = 2;
+
     /// <summary>Rows handed to one worker at a time; large enough to amortise the scratch rent.</summary>
     private const int RowChunk = 64;
 
@@ -72,11 +79,19 @@ public static class QuantMatMul
         if (destination.Length < (long)tokens * rows)
             throw new ArgumentException($"Expected room for {(long)tokens * rows} outputs, got {destination.Length}.", nameof(destination));
 
+        // A block of tokens is a GEMM. Take it through the register-tiled panel kernel,
+        // unless the caller pinned the integer path (tests and the strategy benchmark do).
+        if (Strategy != MatMulStrategy.Integer && tokens >= PanelMinTokens && PanelGemm.Supports(w))
+        {
+            await PanelGemm.ForwardAsync(w, x, tokens, destination, options).ConfigureAwait(false);
+            return;
+        }
+
         bool useInteger = Strategy switch
         {
             MatMulStrategy.Float => false,
             MatMulStrategy.Integer => true,
-            _ => IntegerDot.Supports(w.Type) && cols % IntegerDot.BlockSize == 0,
+            _ => IntegerDot.Supports(w.Type) && cols % IntegerDot.BlockSize == 0 && IntegerWinsFor(w.Type),
         };
 
         if (useInteger)
@@ -112,6 +127,15 @@ public static class QuantMatMul
     public static ValueTask ForwardAsync(
         WeightMatrix w, ReadOnlyMemory<float> x, Memory<float> destination, ParallelOptions options)
         => ForwardAsync(w, x, tokens: 1, destination, options);
+
+    /// <summary>
+    /// With AVX-512 the dequantizers are vectorised, and a decoded row dotted in float beats
+    /// unpacking to int8 for every type but Q8_0. Q8_0's payload is already int8 and skips the
+    /// unpack. Measured with `shieldstral bench`: at one token, Q5_1 runs at 7.6 GFLOP/s in float
+    /// and 2.4 in int8, Q4_0 at 10.9 and 3.6, Q8_0 at 11.6 and 14.5.
+    /// </summary>
+    private static bool IntegerWinsFor(GgmlType type)
+        => !System.Runtime.Intrinsics.X86.Avx512F.IsSupported || type == GgmlType.Q8_0;
 
     private static unsafe void RunRowsFloat(
         WeightMatrix w, ReadOnlySpan<float> x, Span<float> y,

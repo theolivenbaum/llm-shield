@@ -209,8 +209,8 @@ internal static class Benchmark
     private static async Task<List<Dictionary<string, object>>> MatMulThroughput(int repeats, ParallelOptions options)
     {
         Console.WriteLine();
-        Console.WriteLine("matmul: float decode vs integer decode of the weights");
-        Console.WriteLine($"  {"type",-8} {"tokens",6} {"float GFLOP/s",14} {"int8 GFLOP/s",13} " +
+        Console.WriteLine("matmul: row-wise float vs panel GEMM vs integer decode of the weights");
+        Console.WriteLine($"  {"type",-8} {"tokens",6} {"float GFLOP/s",14} {"panel GFLOP/s",14} {"int8 GFLOP/s",13} " +
                           $"{"speedup",8} {"rel.err",9}");
 
         var rows = new List<Dictionary<string, object>>();
@@ -227,7 +227,7 @@ internal static class Benchmark
         {
             byte[] weights = SynthesiseWeights(type, outputs, inputs);
 
-            foreach (int tokens in (int[])[1, 64])
+            foreach (int tokens in (int[])[1, 8, 64, 256])
             {
                 var x = new float[tokens * inputs];
                 var rng = new Random(7);
@@ -246,7 +246,16 @@ internal static class Benchmark
                     Func<ValueTask> floatWork = MatMulWork(handle, type, outputs, inputs, x, tokens, yFloat, options);
 
                     QuantMatMul.Strategy = MatMulStrategy.Float;
+                    int panelMin = QuantMatMul.PanelMinTokens;
+                    QuantMatMul.PanelMinTokens = int.MaxValue;
                     double floatSeconds = await TimeBestAsync(floatWork, 2, repeats + 2).ConfigureAwait(false);
+                    QuantMatMul.PanelMinTokens = 1;
+                    var yPanel = new float[tokens * outputs];
+                    Func<ValueTask> panelWork = MatMulWork(handle, type, outputs, inputs, x, tokens, yPanel, options);
+                    double? panelSeconds = PanelGemm.Supports(type, outputs, inputs)
+                        ? await TimeBestAsync(panelWork, 2, repeats + 2).ConfigureAwait(false) : null;
+                    QuantMatMul.PanelMinTokens = panelMin;
+                    double panelError = panelSeconds is null ? 0 : RelativeL2(yFloat, yPanel);
 
                     double? integerSeconds = null;
                     if (IntegerDot.Supports(type))
@@ -258,11 +267,12 @@ internal static class Benchmark
                     QuantMatMul.Strategy = MatMulStrategy.Auto;
 
                     double floatGflops = flops / floatSeconds / 1e9;
+                    double? panelGflops = panelSeconds is { } ps ? flops / ps / 1e9 : null;
                     double? integerGflops = integerSeconds is { } s ? flops / s / 1e9 : null;
                     double? error = integerSeconds is null ? null : RelativeL2(yFloat, yInteger);
 
                     Console.WriteLine(
-                        $"  {type,-8} {tokens,6} {floatGflops,14:F2} " +
+                        $"  {type,-8} {tokens,6} {floatGflops,14:F2} {panelGflops ?? 0,14:F2} " +
                         $"{(integerGflops is { } g ? g.ToString("F2", CultureInfo.InvariantCulture) : "-"),13} " +
                         $"{(integerGflops is { } g2 ? (g2 / floatGflops).ToString("F2", CultureInfo.InvariantCulture) + "x" : "-"),8} " +
                         $"{(error is { } e ? e.ToString("E2", CultureInfo.InvariantCulture) : "-"),9}");
@@ -272,6 +282,8 @@ internal static class Benchmark
                         ["type"] = type.ToString(),
                         ["tokens"] = tokens,
                         ["float_gflops"] = floatGflops,
+                        ["panel_gflops"] = panelGflops as object ?? "",
+                        ["panel_relative_l2_error"] = panelError,
                         ["integer_gflops"] = integerGflops as object ?? "",
                         ["relative_l2_error"] = error as object ?? "",
                     });

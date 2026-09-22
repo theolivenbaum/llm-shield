@@ -64,6 +64,7 @@ public sealed class ShieldstralModerator : IDisposable
     private readonly ParallelOptions _options;
     private readonly int[] _yesTokens;
     private readonly int[] _noTokens;
+    private readonly int[] _verdictRows;
     private SystemPromptCache? _prefix;
 
     public MinistralModel Model => _model;
@@ -93,6 +94,7 @@ public sealed class ShieldstralModerator : IDisposable
         {
             _yesTokens = ResolveVerdictTokens(YesForms);
             _noTokens = ResolveVerdictTokens(NoForms);
+            _verdictRows = [.. _yesTokens, .. _noTokens];
             if (_yesTokens.Length == 0 || _noTokens.Length == 0)
                 throw new InvalidDataException(
                     "The model's vocabulary has no 'yes'/'no' tokens; this does not look like a Shieldstral checkpoint.");
@@ -226,8 +228,13 @@ public sealed class ShieldstralModerator : IDisposable
     {
         int[] tokens = Tokenize(request);
         int prefilled = PrepareCache(tokens);
-        ReadOnlyMemory<float> logits = await _model.ForwardAsync(tokens.AsMemory(prefilled), options ?? _options).ConfigureAwait(false);
-        return Score(logits.Span, tokens.Length, prefilled);
+        // Only the verdict rows of the LM head: the other 131 thousand are a third of a short
+        // prompt's pass and nobody reads them.
+        float[] verdict = await _model.ForwardSelectedAsync(tokens.AsMemory(prefilled), _verdictRows, options ?? _options)
+            .ConfigureAwait(false);
+        float yes = verdict[..^_noTokens.Length].Max();
+        float no = verdict[_yesTokens.Length..].Max();
+        return FromLogits(yes, no, tokens.Length, prefilled);
     }
 
     /// <summary>
@@ -306,26 +313,16 @@ public sealed class ShieldstralModerator : IDisposable
     /// Renormalises the best "yes" against the best "no".
     ///
     /// Rather than scanning the top-k as the model card's snippet does, the yes/no
-    /// token ids are resolved once up front and read directly — same answer, but it
-    /// cannot fail on a prompt where neither form makes the top 20, and it costs a
-    /// couple of array lookups instead of a 131072-element partial sort.
+    /// token ids are resolved once up front and only their rows of the LM head are
+    /// evaluated. It is the same answer, but it cannot fail on a prompt where neither
+    /// form makes the top 20. It also skips 131 thousand rows of head nobody reads.
     /// </summary>
-    private ModerationResult Score(ReadOnlySpan<float> logits, int promptTokens, int prefilled)
+    private static ModerationResult FromLogits(float yes, float no, int promptTokens, int prefilled)
     {
-        float yes = Best(logits, _yesTokens);
-        float no = Best(logits, _noTokens);
-
         float max = MathF.Max(yes, no);
         float eYes = MathF.Exp(yes - max);
         float eNo = MathF.Exp(no - max);
         return new ModerationResult(eYes / (eYes + eNo), yes, no, promptTokens, prefilled);
-
-        static float Best(ReadOnlySpan<float> values, int[] ids)
-        {
-            float best = float.NegativeInfinity;
-            foreach (int id in ids) if (values[id] > best) best = values[id];
-            return best;
-        }
     }
 
     /// <summary>

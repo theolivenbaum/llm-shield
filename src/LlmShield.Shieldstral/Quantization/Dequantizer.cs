@@ -8,6 +8,7 @@ using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
 using LlmShield.Shieldstral.Gguf;
 
 namespace LlmShield.Shieldstral.Quantization;
@@ -124,8 +125,50 @@ public static unsafe class Dequantizer
 
     // ----------------------------------------------------------- legacy 32-blocks
 
+    /// <summary>Sixteen packed bytes: low nibbles are elements 0-15 of the block, high nibbles 16-31.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static (Vector512<float> Lo, Vector512<float> Hi) Nibbles(byte* qs)
+    {
+        Vector128<byte> q = Vector128.Load(qs);
+        Vector128<byte> lo = q & Vector128.Create((byte)0x0F);
+        Vector128<byte> hi = Vector128.ShiftRightLogical(q, 4);
+        return (Avx512F.ConvertToVector512Single(Avx512F.ConvertToVector512Int32(lo)),
+                Avx512F.ConvertToVector512Single(Avx512F.ConvertToVector512Int32(hi)));
+    }
+
+    /// <summary>Nibbles plus the fifth bit from <paramref name="qh"/>: bit j for element j, bit j+16 for element 16+j.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static (Vector512<float> Lo, Vector512<float> Hi) FiveBit(byte* qs, uint qh)
+    {
+        Vector128<byte> q = Vector128.Load(qs);
+        Vector512<int> lo = Avx512F.ConvertToVector512Int32(q & Vector128.Create((byte)0x0F));
+        Vector512<int> hi = Avx512F.ConvertToVector512Int32(Vector128.ShiftRightLogical(q, 4));
+        Vector512<uint> lanes = Vector512.Create(0u, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+        Vector512<uint> one = Vector512.Create(1u);
+        Vector512<uint> bitLo = Avx512F.ShiftRightLogicalVariable(Vector512.Create(qh), lanes) & one;
+        Vector512<uint> bitHi = Avx512F.ShiftRightLogicalVariable(Vector512.Create(qh >> 16), lanes) & one;
+        lo |= Vector512.ShiftLeft(bitLo, 4).AsInt32();
+        hi |= Vector512.ShiftLeft(bitHi, 4).AsInt32();
+        return (Avx512F.ConvertToVector512Single(lo), Avx512F.ConvertToVector512Single(hi));
+    }
+
     private static void Q4_0(byte* src, float* dst, int n)
     {
+        if (Avx512F.IsSupported)
+        {
+            // The prefill GEMM decodes every weight once per pass; at a nanosecond a weight
+            // the scalar loop cost as much as the multiply for a 64-token prompt. The vector
+            // path keeps the scalar arithmetic (one multiply, no FMA), so it is bit-identical.
+            Vector512<float> eight = Vector512.Create(8f);
+            for (int b = 0; b < n / 32; b++, src += 18, dst += 32)
+            {
+                Vector512<float> d = Vector512.Create((float)Read<Half>(src));
+                (Vector512<float> lo, Vector512<float> hi) = Nibbles(src + 2);
+                Vector512.Store(d * (lo - eight), dst);
+                Vector512.Store(d * (hi - eight), dst + 16);
+            }
+            return;
+        }
         for (int b = 0; b < n / 32; b++, src += 18, dst += 32)
         {
             float d = (float)Read<Half>(src);
@@ -140,6 +183,18 @@ public static unsafe class Dequantizer
 
     private static void Q4_1(byte* src, float* dst, int n)
     {
+        if (Avx512F.IsSupported)
+        {
+            for (int b = 0; b < n / 32; b++, src += 20, dst += 32)
+            {
+                Vector512<float> d = Vector512.Create((float)Read<Half>(src));
+                Vector512<float> m = Vector512.Create((float)Read<Half>(src + 2));
+                (Vector512<float> lo, Vector512<float> hi) = Nibbles(src + 4);
+                Vector512.Store(d * lo + m, dst);
+                Vector512.Store(d * hi + m, dst + 16);
+            }
+            return;
+        }
         for (int b = 0; b < n / 32; b++, src += 20, dst += 32)
         {
             float d = (float)Read<Half>(src);
@@ -155,6 +210,18 @@ public static unsafe class Dequantizer
 
     private static void Q5_0(byte* src, float* dst, int n)
     {
+        if (Avx512F.IsSupported)
+        {
+            Vector512<float> sixteen = Vector512.Create(16f);
+            for (int b = 0; b < n / 32; b++, src += 22, dst += 32)
+            {
+                Vector512<float> d = Vector512.Create((float)Read<Half>(src));
+                (Vector512<float> lo, Vector512<float> hi) = FiveBit(src + 6, Read<uint>(src + 2));
+                Vector512.Store(d * (lo - sixteen), dst);
+                Vector512.Store(d * (hi - sixteen), dst + 16);
+            }
+            return;
+        }
         for (int b = 0; b < n / 32; b++, src += 22, dst += 32)
         {
             float d = (float)Read<Half>(src);
@@ -172,6 +239,18 @@ public static unsafe class Dequantizer
 
     private static void Q5_1(byte* src, float* dst, int n)
     {
+        if (Avx512F.IsSupported)
+        {
+            for (int b = 0; b < n / 32; b++, src += 24, dst += 32)
+            {
+                Vector512<float> d = Vector512.Create((float)Read<Half>(src));
+                Vector512<float> m = Vector512.Create((float)Read<Half>(src + 2));
+                (Vector512<float> lo, Vector512<float> hi) = FiveBit(src + 8, Read<uint>(src + 4));
+                Vector512.Store(d * lo + m, dst);
+                Vector512.Store(d * hi + m, dst + 16);
+            }
+            return;
+        }
         for (int b = 0; b < n / 32; b++, src += 24, dst += 32)
         {
             float d = (float)Read<Half>(src);
@@ -190,6 +269,19 @@ public static unsafe class Dequantizer
 
     private static void Q8_0(byte* src, float* dst, int n)
     {
+        if (Avx512F.IsSupported)
+        {
+            for (int b = 0; b < n / 32; b++, src += 34, dst += 32)
+            {
+                Vector512<float> d = Vector512.Create((float)Read<Half>(src));
+                sbyte* qs = (sbyte*)(src + 2);
+                Vector512<float> a = Avx512F.ConvertToVector512Single(Avx512F.ConvertToVector512Int32(Vector128.Load(qs)));
+                Vector512<float> c = Avx512F.ConvertToVector512Single(Avx512F.ConvertToVector512Int32(Vector128.Load(qs + 16)));
+                Vector512.Store(a * d, dst);
+                Vector512.Store(c * d, dst + 16);
+            }
+            return;
+        }
         for (int b = 0; b < n / 32; b++, src += 34, dst += 32)
         {
             float d = (float)Read<Half>(src);

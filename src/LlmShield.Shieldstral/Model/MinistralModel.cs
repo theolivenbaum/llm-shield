@@ -156,14 +156,81 @@ public sealed class MinistralModel : IDisposable
         ReadOnlyMemory<int> tokens, IActivationSink? capture, ParallelOptions options)
         => ForwardAsync(tokens, capture, options, computeLogits: true);
 
-    private async ValueTask<ReadOnlyMemory<float>> ForwardAsync(
+    /// <summary>
+    /// Appends <paramref name="tokens"/> and returns the logits of just <paramref name="vocabRows"/>
+    /// at the final position. A verdict that reads a handful of tokens has no use for the other
+    /// 131 thousand rows of the LM head. Decoding and multiplying them was more work than a
+    /// short suffix's whole pass through the layers.
+    /// </summary>
+    public async ValueTask<float[]> ForwardSelectedAsync(
+        ReadOnlyMemory<int> tokens, int[] vocabRows, ParallelOptions options)
+    {
+        var result = new float[1][];
+        await ForwardAsync(tokens, null, options, computeLogits: false, branchOffsets: null,
+            selectedRows: vocabRows, selectedOut: result).ConfigureAwait(false);
+        return result[0];
+    }
+
+    /// <summary>
+    /// Runs several continuations of the cached prefix in one pass, as independent
+    /// branches: each attends to the whole prefix and to its own earlier tokens, never to
+    /// another branch's. RoPE positions restart at the prefix length in every branch, so
+    /// each branch sees exactly what it would if it were run alone after the prefix.
+    /// This is how a decision's option reads, a few dozen tokens each, become one GEMM
+    /// instead of N passes that each re-stream every weight.
+    /// <para>
+    /// Returns the logits of <paramref name="vocabRows"/> at each branch's last token. The
+    /// branch tokens are left in the KV cache; <see cref="KvCache.Truncate"/> back to the
+    /// prefix before the cache is used for anything else.
+    /// </para>
+    /// </summary>
+    public ValueTask<float[][]> ForwardBranchesAsync(
+        IReadOnlyList<int[]> branches, int[] vocabRows, ParallelOptions options)
+        => ForwardTreeAsync(ReadOnlyMemory<int>.Empty, branches, vocabRows, options);
+
+    /// <summary>
+    /// <see cref="ForwardBranchesAsync"/> with a shared <paramref name="trunk"/> in the same
+    /// pass: the trunk is appended causally, then every branch continues from its end. A
+    /// decision is then one pass, prefix and options together. Every weight is decoded once
+    /// per decision instead of twice, and the GEMM sees one tall batch of tokens instead of
+    /// a long one and a short one.
+    /// </summary>
+    public async ValueTask<float[][]> ForwardTreeAsync(
+        ReadOnlyMemory<int> trunk, IReadOnlyList<int[]> branches, int[] vocabRows, ParallelOptions options)
+    {
+        ArgumentNullException.ThrowIfNull(branches);
+        if (branches.Count == 0) throw new ArgumentException("No branches to forward.", nameof(branches));
+        var offsets = new int[branches.Count];
+        int total = trunk.Length;
+        for (int b = 0; b < branches.Count; b++)
+        {
+            if (branches[b].Length == 0) throw new ArgumentException($"Branch {b} is empty.", nameof(branches));
+            offsets[b] = total;
+            total += branches[b].Length;
+        }
+        var tokens = new int[total];
+        trunk.Span.CopyTo(tokens);
+        for (int b = 0; b < branches.Count; b++) branches[b].CopyTo(tokens, offsets[b]);
+
+        var result = new float[branches.Count][];
+        await ForwardAsync(tokens, null, options, computeLogits: false, offsets, vocabRows, result).ConfigureAwait(false);
+        return result;
+    }
+
+    private ValueTask<ReadOnlyMemory<float>> ForwardAsync(
         ReadOnlyMemory<int> tokens, IActivationSink? capture, ParallelOptions options, bool computeLogits)
+        => ForwardAsync(tokens, capture, options, computeLogits, null, null, null);
+
+    private async ValueTask<ReadOnlyMemory<float>> ForwardAsync(
+        ReadOnlyMemory<int> tokens, IActivationSink? capture, ParallelOptions options, bool computeLogits,
+        int[]? branchOffsets, int[]? selectedRows, float[][]? selectedOut)
     {
         ArgumentNullException.ThrowIfNull(options);
         if (tokens.Length == 0) throw new ArgumentException("No tokens to forward.", nameof(tokens));
 
         int seq = tokens.Length;
         int startPos = KvCache.Length;
+        Branches? layout = branchOffsets is null ? null : new Branches(branchOffsets, seq, startPos);
         int hidden = Config.HiddenSize;
         int ff = Config.FeedForwardSize;
 
@@ -193,7 +260,8 @@ public sealed class MinistralModel : IDisposable
                 NormRows(h.Span, layer.AttentionNorm, norm.Span, seq, hidden);
                 capture?.Observe($"blk.{l}.attn_norm", norm.Span, seq, hidden);
 
-                await AttentionAsync(layer, l, norm, queries, scratch, seq, startPos, capture, options).ConfigureAwait(false);
+                await AttentionAsync(layer, l, norm, queries, scratch, seq, startPos, layout, capture, options).ConfigureAwait(false);
+
                 capture?.Observe($"blk.{l}.attn_out", scratch.Span, seq, hidden);
 
                 Kernels.Add(h.Span, scratch.Span);
@@ -213,6 +281,32 @@ public sealed class MinistralModel : IDisposable
             }
 
             KvCache.Advance(seq);
+
+            if (selectedRows is not null && selectedOut is not null)
+            {
+                WeightMatrix table = _lmHead.IsEmpty ? _tokenEmbeddings : _lmHead;
+                float[] row = ArrayPool<float>.Shared.Rent(hidden);
+                try
+                {
+                    Span<float> n = norm.Span[..hidden];
+                    for (int b = 0; b < selectedOut.Length; b++)
+                    {
+                        int lastToken = layout is null ? seq - 1 : layout.Value.LastToken(b);
+                        Kernels.RmsNorm(h.Span.Slice(lastToken * hidden, hidden), _outputNorm, Config.RmsNormEps, n);
+                        var logits = new float[selectedRows.Length];
+                        for (int i = 0; i < selectedRows.Length; i++)
+                        {
+                            table.DequantizeRow(selectedRows[i], row.AsSpan(0, hidden));
+                            logits[i] = Kernels.Dot(n, row.AsSpan(0, hidden));
+                        }
+                        selectedOut[b] = logits;
+                    }
+                }
+                finally
+                {
+                    ArrayPool<float>.Shared.Return(row);
+                }
+            }
             if (!computeLogits) return default;
 
             // Only the last position feeds the LM head: Shieldstral's verdict is a
@@ -250,7 +344,7 @@ public sealed class MinistralModel : IDisposable
     /// <param name="output">Receives the attention block's contribution, seq × hidden.</param>
     private async ValueTask AttentionAsync(
         Layer layer, int layerIndex, ReadOnlyMemory<float> input,
-        float[] queryBuffer, Memory<float> output, int seq, int startPos,
+        float[] queryBuffer, Memory<float> output, int seq, int startPos, Branches? layout,
         IActivationSink? capture, ParallelOptions options)
     {
         int heads = Config.HeadCount, kvHeads = Config.KvHeadCount, headDim = Config.HeadDim;
@@ -260,7 +354,7 @@ public sealed class MinistralModel : IDisposable
 
         Memory<float> q = queryBuffer.AsMemory(0, seq * qDim);
         await QuantMatMul.ForwardAsync(layer.Q, input, seq, q, options).ConfigureAwait(false);
-        RotateQueries(q.Span, heads, headDim, qDim, seq, startPos);
+        RotateQueries(q.Span, heads, headDim, qDim, seq, startPos, layout);
         capture?.Observe($"blk.{layerIndex}.q_rope", q.Span, seq, qDim);
 
         // K and V land straight in their cache slots, so the cache always holds
@@ -271,7 +365,7 @@ public sealed class MinistralModel : IDisposable
             Memory<float> kv = staging.AsMemory(0, seq * kvDim);
 
             await QuantMatMul.ForwardAsync(layer.K, input, seq, kv, options).ConfigureAwait(false);
-            StoreKeys(kv.Span, layerIndex, kvHeads, headDim, kvDim, seq, startPos);
+            StoreKeys(kv.Span, layerIndex, kvHeads, headDim, kvDim, seq, startPos, layout);
             capture?.Observe($"blk.{layerIndex}.k_rope", kv.Span, seq, kvDim);
 
             await QuantMatMul.ForwardAsync(layer.V, input, seq, kv, options).ConfigureAwait(false);
@@ -298,7 +392,15 @@ public sealed class MinistralModel : IDisposable
             // pool is what makes that free: a per-head cache on the model would have
             // to be sized for the widest fan-out any caller ever asks for, and would
             // pin every one of those buffers for the model's lifetime.
-            await Parallel.ForAsync(0, heads, options, (head, _) =>
+            if (headDim == AttentionKernels.HeadDim && AttentionKernels.Supported)
+            {
+                await Parallel.ForAsync(0, heads, options, (head, _) =>
+                {
+                    AttendHead(cache, layerIndex, head / group, head, q, context, seq, startPos, cacheLength, qDim, scale, layout);
+                    return ValueTask.CompletedTask;
+                }).ConfigureAwait(false);
+            }
+            else await Parallel.ForAsync(0, heads, options, (head, _) =>
             {
                 float[] scores = ArrayPool<float>.Shared.Rent(cacheLength);
                 try
@@ -309,18 +411,28 @@ public sealed class MinistralModel : IDisposable
 
                     for (int t = 0; t < seq; t++)
                     {
-                        int limit = startPos + t + 1;                      // causal mask
+                        // Visible keys: everything shared [0, shared), then this token's own
+                        // segment up to itself. For a plain sequence both are startPos and the
+                        // two ranges are simply the causal mask [0, startPos + t].
+                        int self = startPos + t;
+                        int shared = layout?.Shared(t) ?? startPos;
+                        int segment = layout?.SegmentStart(t) ?? startPos;
+                        int limit = shared + (self - segment + 1);
                         ReadOnlySpan<float> query = q.Span.Slice(t * qDim + head * headDim, headDim);
                         Span<float> row = scores.AsSpan(0, limit);
-                        for (int p = 0; p < limit; p++)
-                            row[p] = Kernels.Dot(query, keys.Slice(p * headDim, headDim)) * scale;
+                        for (int i = 0; i < limit; i++)
+                        {
+                            int p = i < shared ? i : segment + (i - shared);
+                            row[i] = Kernels.Dot(query, keys.Slice(p * headDim, headDim)) * scale;
+                        }
                         Kernels.Softmax(row);
 
                         Span<float> sink = context.Span.Slice(t * qDim + head * headDim, headDim);
                         sink.Clear();
-                        for (int p = 0; p < limit; p++)
+                        for (int i = 0; i < limit; i++)
                         {
-                            float w = row[p];
+                            float w = row[i];
+                            int p = i < shared ? i : segment + (i - shared);
                             if (w != 0f) Kernels.AddScaled(sink, values.Slice(p * headDim, headDim), w);
                         }
                     }
@@ -343,22 +455,101 @@ public sealed class MinistralModel : IDisposable
         }
     }
 
-    private void RotateQueries(Span<float> q, int heads, int headDim, int qDim, int seq, int startPos)
+    /// <summary>
+    /// One query head over its KV head: transpose the cached keys once, then score and
+    /// accumulate every token of this call with <see cref="AttentionKernels"/>. Visibility is
+    /// the same two ranges as the portable loop: [0, shared) and the token's own segment.
+    /// </summary>
+    private static unsafe void AttendHead(KvCache cache, int layer, int kvHead, int head, Memory<float> q,
+        Memory<float> context, int seq, int startPos, int cacheLength, int qDim, float scale, Branches? layout)
+    {
+        const int hd = AttentionKernels.HeadDim;
+        int ldk = (cacheLength + 15) & ~15;
+        float[] kt = ArrayPool<float>.Shared.Rent(hd * ldk);
+        // Four score rows: queries are taken four at a time while they share a segment.
+        float[] scores = ArrayPool<float>.Shared.Rent(4 * cacheLength);
+        try
+        {
+            fixed (float* keys = cache.KeyHistory(layer, kvHead, cacheLength))
+            fixed (float* values = cache.ValueHistory(layer, kvHead, cacheLength))
+            fixed (float* k = kt)
+            fixed (float* rows = scores)
+            fixed (float* qs = q.Span)
+            fixed (float* ctx = context.Span)
+            {
+                AttentionKernels.TransposeKeys(keys, cacheLength, k, ldk);
+                int t = 0;
+                while (t < seq)
+                {
+                    int shared = layout?.Shared(t) ?? startPos;
+                    int segment = layout?.SegmentStart(t) ?? startPos;
+
+                    // Up to four consecutive tokens of the same segment. They see the same
+                    // shared range, and their own ranges are prefixes of the last one's.
+                    int n = 1;
+                    while (n < 4 && t + n < seq
+                           && (layout?.Shared(t + n) ?? startPos) == shared
+                           && (layout?.SegmentStart(t + n) ?? startPos) == segment) n++;
+
+                    int ownLast = startPos + t + n - 1 - segment + 1;
+                    float* r0 = rows, r1 = rows + cacheLength, r2 = rows + 2 * cacheLength, r3 = rows + 3 * cacheLength;
+                    float* q0 = qs + (long)t * qDim + head * hd;
+                    float* q1 = n > 1 ? q0 + qDim : q0;
+                    float* q2 = n > 2 ? q0 + 2 * qDim : q0;
+                    float* q3 = n > 3 ? q0 + 3 * qDim : q0;
+                    if (n == 1)
+                    {
+                        AttentionKernels.Scores(q0, k, ldk, 0, shared, scale, r0);
+                        AttentionKernels.Scores(q0, k, ldk, segment, ownLast, scale, r0 + shared);
+                    }
+                    else
+                    {
+                        AttentionKernels.Scores4(q0, q1, q2, q3, k, ldk, 0, shared, scale, r0, r1, r2, r3);
+                        AttentionKernels.Scores4(q0, q1, q2, q3, k, ldk, segment, ownLast, scale,
+                            r0 + shared, r1 + shared, r2 + shared, r3 + shared);
+                    }
+
+                    // Each softmax runs over exactly the keys its query may see.
+                    int c0 = shared + ownLast - (n - 1);
+                    for (int j = 0; j < n; j++)
+                        Kernels.Softmax(new Span<float>(rows + j * cacheLength, c0 + j));
+
+                    float* o = ctx + (long)t * qDim + head * hd;
+                    int j2 = 0;
+                    for (; j2 + 2 <= n; j2 += 2)
+                        AttentionKernels.WeightedSum2(rows + j2 * cacheLength, c0 + j2, rows + (j2 + 1) * cacheLength,
+                            c0 + j2 + 1, shared, segment, values, o + j2 * qDim, o + (j2 + 1) * qDim);
+                    if (j2 < n)
+                        AttentionKernels.WeightedSum(rows + j2 * cacheLength, c0 + j2, shared, segment, values, o + j2 * qDim);
+                    t += n;
+                }
+            }
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(kt);
+            ArrayPool<float>.Shared.Return(scores);
+        }
+    }
+
+    private void RotateQueries(Span<float> q, int heads, int headDim, int qDim, int seq, int startPos, Branches? layout)
     {
         for (int t = 0; t < seq; t++)
         {
             Span<float> row = q.Slice(t * qDim, qDim);
-            _rope.Apply(row, heads, headDim, startPos + t);
-            ApplyPositionScale(row, startPos + t);
+            int position = layout?.Position(t) ?? startPos + t;
+            _rope.Apply(row, heads, headDim, position);
+            ApplyPositionScale(row, position);
         }
     }
 
-    private void StoreKeys(Span<float> kv, int layerIndex, int kvHeads, int headDim, int kvDim, int seq, int startPos)
+    private void StoreKeys(Span<float> kv, int layerIndex, int kvHeads, int headDim, int kvDim, int seq, int startPos,
+        Branches? layout)
     {
         for (int t = 0; t < seq; t++)
         {
             Span<float> row = kv.Slice(t * kvDim, kvDim);
-            _rope.Apply(row, kvHeads, headDim, startPos + t);
+            _rope.Apply(row, kvHeads, headDim, layout?.Position(t) ?? startPos + t);
             for (int kh = 0; kh < kvHeads; kh++)
                 row.Slice(kh * headDim, headDim).CopyTo(KvCache.Key(layerIndex, kh, startPos + t));
         }
@@ -393,6 +584,32 @@ public sealed class MinistralModel : IDisposable
     {
         if (_ownsFile) _gguf.Dispose();
     }
+}
+
+/// <summary>
+/// Where each token of a branched forward sits. Tokens before the first offset are a
+/// causal trunk; each offset starts a branch that sees the cache, the whole trunk and its
+/// own earlier tokens. Token t is always written to cache slot startPos + t; what varies is
+/// its RoPE position and which slots it may attend to.
+/// </summary>
+internal readonly struct Branches(int[] offsets, int tokens, int startPos)
+{
+    private int Trunk => offsets[0];
+
+    private int BranchOf(int t)
+    {
+        int i = Array.BinarySearch(offsets, t);
+        return i >= 0 ? i : ~i - 1;
+    }
+
+    public int Position(int t) => t < Trunk ? startPos + t : startPos + Trunk + (t - offsets[BranchOf(t)]);
+
+    /// <summary>Slots [0, Shared) are visible in full: the cache for a trunk token, cache plus trunk for a branch token.</summary>
+    public int Shared(int t) => t < Trunk ? startPos : startPos + Trunk;
+
+    public int SegmentStart(int t) => t < Trunk ? startPos : startPos + offsets[BranchOf(t)];
+
+    public int LastToken(int branch) => (branch + 1 < offsets.Length ? offsets[branch + 1] : tokens) - 1;
 }
 
 /// <summary>
