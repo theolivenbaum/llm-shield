@@ -127,6 +127,11 @@ class Shieldstral(nn.Module):
         self.beta4 = float((p.get("llama_4_scaling") or {}).get("beta", 0.0))
         self.n_orig4 = int((p.get("llama_4_scaling") or {}).get("original_max_position_embeddings", 16384))
 
+        # Residual-stream taps: set tap_layers to {k, ...} and each forward leaves the state
+        # after layer k (1-based; 26 = the last layer, pre final norm) in self.taps[k].
+        self.tap_layers: set[int] | None = None
+        self.taps: dict[int, torch.Tensor] = {}
+
         self.tok = TekkenTokenizer(model_dir / "tekken.json")
         self.yes_ids, self.no_ids = verdict_ids(self.tok)
 
@@ -186,6 +191,8 @@ class Shieldstral(nn.Module):
                 h = h + layer.wo(o.transpose(1, 2).reshape(B, T, -1))
                 f = rmsnorm(h, layer.ffn_norm, self.eps)
                 h = h + layer.w2(F.silu(layer.w1(f)) * layer.w3(f))
+            if self.tap_layers is not None and l + 1 in self.tap_layers:
+                self.taps[l + 1] = h
         return h, new_kv
 
     def prefix(self, ids: list[int], grad_from: int = 0):
