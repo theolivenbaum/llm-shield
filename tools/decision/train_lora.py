@@ -37,7 +37,7 @@ sys.path.insert(0, str(HERE))
 
 from engine import Decider  # noqa: E402
 from lora_io import save_lora  # noqa: E402
-from shieldstral_torch import Shieldstral  # noqa: E402
+from jevstral_torch import Shieldstral  # noqa: E402
 
 
 # ------------------------------------------------------------------ data

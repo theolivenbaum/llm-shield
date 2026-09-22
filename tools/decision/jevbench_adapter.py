@@ -1,7 +1,7 @@
-"""JevBench adapter for Shieldstral typed decisions, in the shape of jevbench's `laya_local` adapter.
+"""JevBench adapter for Jevstral typed decisions, in the shape of jevbench's `laya_local` adapter.
 
 Two backends, one prompt:
-  csharp  the product: `shieldstral decide <gguf> --serve`, a persistent subprocess running the
+  csharp  the product: `jev decide <gguf> --serve`, a persistent subprocess running the
           .NET runtime (CPU, no native dependency), JSONL in and out
   torch   the research path: tools/decision/engine.py on bf16 weights, optionally with a LoRA
 
@@ -30,11 +30,11 @@ sys.path.insert(0, str(HERE))
 
 from jevbench.adapters.base import DecisionResult  # noqa: E402
 
-CLI = HERE.parents[1] / "src/LlmShield.Shieldstral.Cli/bin/Release/net10.0/shieldstral.dll"
+CLI = HERE.parents[1] / "src/Jevstral.Cli/bin/Release/net10.0/jev.dll"
 
 
-class ShieldstralAdapter:
-    name = "shieldstral_local"
+class JevstralAdapter:
+    name = "jevstral_local"
     cost_basis = "local_cpu_no_provider_tariff"
 
     def __init__(self, endpoint=None, model=None, key_env="", timeout_s=None, price_input_per_m=None,
@@ -65,7 +65,7 @@ class ShieldstralAdapter:
             import torch
             from engine import Decider
             from lora_io import load_lora
-            from shieldstral_torch import Shieldstral
+            from jevstral_torch import Shieldstral
 
             torch.set_num_threads(self.threads)
             state, cfg = load_lora(self.lora) if self.lora else (None, None)
@@ -139,7 +139,7 @@ def main():
         tasks += load_jsonl(str(JEVBENCH / "datasets/public" / f"{t}.jsonl"))
     if a.limit:
         tasks = tasks[:a.limit]
-    adapter = ShieldstralAdapter(endpoint=a.model, backend=a.backend, temps=a.temps, lora=a.lora,
+    adapter = JevstralAdapter(endpoint=a.model, backend=a.backend, temps=a.temps, lora=a.lora,
                                  threads=a.threads, price_input_per_m=0, price_output_per_m=0)
     ledger = Ledger(str(run / "ledger.jsonl"))
     runner = Runner(adapter, ledger, run / "raw", default_reserve_usd=0.0)

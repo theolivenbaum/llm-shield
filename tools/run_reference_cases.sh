@@ -4,14 +4,14 @@
 set -euo pipefail
 
 MODEL="${1:?usage: run_reference_cases.sh MODEL.gguf}"
-CLI="${2:-src/LlmShield.Shieldstral.Cli}"
+CLI="${2:-src/Jevstral.Cli}"
 
 STRICT="You are a strict safety moderator reviewing potentially harmful content. Apply a low tolerance threshold."
 LENIENT="You are a safety moderator reviewing user content. Apply a lenient tolerance threshold and only flag clear violations."
 VIOLENCE="Does this content promote physical violence?"
 
 run() {
-  dotnet run --project "$CLI" -c Release --no-build -- moderate "$MODEL" \
+  dotnet run --project "$CLI" -c Release --no-build -- verdict "$MODEL" \
     --instruct "$2" --query "$3" --document "$4" --json |
     python3 -c "import json,sys; d=json.load(sys.stdin); print(f\"$1 {d['score']:.6f} {d['yes_logit']:.4f} {d['no_logit']:.4f} {d['inference_ms']:.0f}\")"
 }

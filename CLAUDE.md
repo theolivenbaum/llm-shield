@@ -4,12 +4,22 @@ Guidance for working in this repository.
 
 ## What this is
 
-A managed .NET 10 runtime for one model: Mistral's Shieldstral 1.0 3B safety
-classifier. It is a reduction of
-[TensorSharp](https://github.com/zhongkaifu/TensorSharp) (BSD-3-Clause) down to
-what this single architecture needs, with no native dependency and no backend
-abstraction — one CPU path, written around `System.Numerics.Tensors` and
-`Vector<T>`.
+Jevstral: typed, calibrated decisions (noul / choice / score, the schema of Jev, laya and
+djev, scored by JevBench) from a 3B decoder, on a CPU, in managed .NET 10. It is a fork of
+a runtime for Mistral's Shieldstral 1.0 3B safety classifier. Shieldstral is still the base
+checkpoint: its weights, its tokenizer and its yes/no verdict are what Jevstral reads and
+adapts. The moderation product is gone. `VerdictScorer` keeps the base checkpoint's native
+instruct/query/document question as the primitive the fixtures check against.
+
+The numerics are a reduction of [TensorSharp](https://github.com/zhongkaifu/TensorSharp)
+(BSD-3-Clause) to what this one architecture needs. There is no native dependency and no
+backend abstraction: one CPU path, written around `System.Numerics.Tensors`, `Vector<T>` and
+`Vector512`.
+
+This repository is not bound to Shieldstral's behaviour: the architecture, the output layers
+and the prompt may all change when that gets closer to good decisions. What must hold is
+parity between `tools/decision` (where adapters are trained) and the C# runtime (where they
+run).
 
 Files carrying logic derived from TensorSharp say so in their header. Keep that
 attribution when you move code between files; `third-party/TensorSharp-LICENSE`
@@ -18,16 +28,16 @@ is the licence it is carried under.
 ## Layout
 
 ```
-src/LlmShield.Shieldstral/
+src/Jevstral/
   Gguf/            GgmlType.cs (block geometry), GgufFile.cs (mmap reader)
   Quantization/    Dequantizer.cs (every GGML type), QuantGrids.g.cs (generated)
   Numerics/        Kernels.cs, QuantMatMul.cs, PanelGemm.cs, AttentionKernels.cs, WeightMatrix.cs
   Tokenization/    TekkenTokenizer.cs
   Model/           ModelConfig.cs, Rope.cs, KvCache.cs, MinistralModel.cs
-  ChatTemplate.cs, SystemPromptCache.cs, ShieldstralModerator.cs, ShieldstralDecider.cs,
+  ChatTemplate.cs, SystemPromptCache.cs, VerdictScorer.cs, JevstralDecider.cs,
   ModelDownloader.cs
-src/LlmShield.Shieldstral.Cli/    the `shieldstral` command
-tests/LlmShield.Shieldstral.Tests/
+src/Jevstral.Cli/    the `jev` command
+tests/Jevstral.Tests/
 tests/fixtures/                   generated oracles (JSON), committed
 tools/                            Python: conversion, reference impl, fixtures
 tools/decision/                   PyTorch research path: typed decisions, JevBench eval, LoRA
@@ -125,7 +135,7 @@ it back.
 
 ```bash
 dotnet test                                          # no weights needed
-SHIELDSTRAL_MODEL=/path/to/model.gguf dotnet test    # + model-backed parity
+JEVSTRAL_MODEL=/path/to/model.gguf dotnet test    # + model-backed parity
 ```
 
 Tests that change `QuantMatMul.Strategy` must join
@@ -135,7 +145,7 @@ enough — one class pinning it to Float while another pins it to Integer makes 
 measure whatever the scheduler left behind, and it fails intermittently, which is
 worse than failing. The collection disables parallelism between them.
 
-`SHIELDSTRAL_MODEL` may be a `.gguf` or a directory to search. Model-backed tests
+`JEVSTRAL_MODEL` may be a `.gguf` or a directory to search. Model-backed tests
 write a line explaining the skip and pass when it is unset — keep that pattern
 for new ones, so a checkout without a 3.4 GiB download stays green.
 
@@ -147,7 +157,7 @@ seven significant figures.
 ## Benchmarking
 
 ```bash
-dotnet run --project src/LlmShield.Shieldstral.Cli -c Release -- \
+dotnet run --project src/Jevstral.Cli -c Release -- \
   bench /path/to/models --json benchmark.json
 ```
 
@@ -279,7 +289,7 @@ bounds both the noise and any systematic bias.
 
 ## Typed decisions
 
-`ShieldstralDecider` answers the Jev / laya / djev typed questions (noul, choice, score) with
+`JevstralDecider` answers the Jev / laya / djev typed questions (noul, choice, score) with
 Shieldstral's own yes/no verdict. It makes one read per option, "is option X the correct
 answer?", and runs a softmax over the per-option log-odds. A noul is read as a two-option
 choice between its false and true criteria. Asking it directly leaves a topical yes-bias
@@ -294,7 +304,7 @@ are trained (`tools/decision/README.md`), and a LoRA is only valid for its promp
 ## Releasing
 
 `.devops/azure-pipelines.yml` builds `main`, runs the tests and pushes
-`LlmShield.Shieldstral` to nuget.org through the `nuget-curiosity-org` service
+`Jevstral` to nuget.org through the `nuget-curiosity-org` service
 connection. Versions are CalVer — `yy.M.<buildId mod 65536>`, stamped by
 `/p:Version` at build time, the modulo because the build counter has to fit an
 int16. `Directory.Build.props` keeps `IsPackable` false, so a new project is not

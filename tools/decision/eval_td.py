@@ -48,7 +48,7 @@ def main():
     import torch
     from engine import Decider
     from lora_io import load_lora
-    from shieldstral_torch import Shieldstral
+    from jevstral_torch import Shieldstral
     from train_lora import load_sources
 
     torch.set_num_threads(a.threads)

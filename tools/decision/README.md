@@ -1,6 +1,6 @@
 # Typed decisions with Shieldstral
 
-This directory is the research path behind `ShieldstralDecider`. It measures how well a 3B
+This directory is the research path behind `JevstralDecider`. It measures how well a 3B
 policy-safety classifier does the kind of typed, calibrated decisions that
 [laya](https://github.com/theolivenbaum/laya) and [djev](https://github.com/theolivenbaum/djev-dev)
 make, scored on the public tiers of JevBench. It also trains LoRA adapters that the C#
@@ -12,8 +12,8 @@ training possible here.
 
 | file | what it does |
 |---|---|
-| `shieldstral_torch.py` | PyTorch Shieldstral: prefix KV reuse, batched option reads, LoRA hooks. `python3 shieldstral_torch.py MODEL_DIR` reproduces `tests/fixtures/scores.json`. |
-| `decision_prompts.py` | noul / choice / score → yes/no reads. The prompt the C# `ShieldstralDecider` renders byte for byte. |
+| `jevstral_torch.py` | PyTorch Shieldstral: prefix KV reuse, batched option reads, LoRA hooks. `python3 jevstral_torch.py MODEL_DIR` reproduces `tests/fixtures/scores.json`. |
+| `decision_prompts.py` | noul / choice / score → yes/no reads. The prompt the C# `JevstralDecider` renders byte for byte. |
 | `engine.py` | `Decider`: one shared prefix, one batched pass over the option queries, softmax over log-odds |
 | `eval_jevbench.py` | public JevBench tiers, scored with jevbench's own `score_task`, Brier, ECE and TVD |
 | `eval_td.py` | `LocalLLaMA/typed-decisions` test split (laya's fine-tune benchmark) |
@@ -21,7 +21,7 @@ training possible here.
 | `train_lora.py` | LoRA on the verdict itself, listwise over options, soft targets |
 | `fit_temps.py` | per-type temperature, fitted on non-JevBench held-out data |
 | `merge_lora_to_gguf.py` | folds an adapter into a GGUF for the C# runtime |
-| `jevbench_adapter.py` | a JevBench adapter (`shieldstral_local`) for either backend, plus a runner |
+| `jevbench_adapter.py` | a JevBench adapter (`jevstral_local`) for either backend, plus a runner |
 
 ## How a typed decision becomes Shieldstral reads
 
@@ -63,7 +63,7 @@ softmax(z / T). Three findings shaped this:
 ```bash
 pip install torch safetensors numpy regex pandas pyarrow gguf
 python3 tools/download_shieldstral.py ~/models/shieldstral        # original bf16 weights, 7.2 GiB
-python3 tools/decision/shieldstral_torch.py ~/models/shieldstral   # parity with the fixtures
+python3 tools/decision/jevstral_torch.py ~/models/shieldstral   # parity with the fixtures
 
 # zero-shot on public JevBench
 python3 tools/decision/eval_jevbench.py --out ~/runs/zs.jsonl --layout docfirst
@@ -76,7 +76,7 @@ python3 tools/decision/train_lora.py --data td:~/models/td/train.parquet@300 syn
 
 # C# runtime: merge and run
 python3 tools/decision/merge_lora_to_gguf.py ~/models/shieldstral ~/models/lora_v1.pt --outfile ~/models/decision-q8_0.gguf
-dotnet run --project src/LlmShield.Shieldstral.Cli -c Release -- decide ~/models/decision-q8_0.gguf --tasks tasks.jsonl
+dotnet run --project src/Jevstral.Cli -c Release -- decide ~/models/decision-q8_0.gguf --tasks tasks.jsonl
 ```
 
 ## Contamination

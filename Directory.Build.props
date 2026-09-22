@@ -14,11 +14,11 @@
     <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
     <TieredPGO>true</TieredPGO>
 
-    <ShieldstralVersion>1.0.0</ShieldstralVersion>
-    <Version Condition="'$(Version)' == ''">$(ShieldstralVersion)</Version>
+    <JevstralVersion>1.0.0</JevstralVersion>
+    <Version Condition="'$(Version)' == ''">$(JevstralVersion)</Version>
     <Authors>Curiosity GmbH</Authors>
     <PackageLicenseExpression>BSD-3-Clause</PackageLicenseExpression>
-    <RepositoryUrl>https://github.com/curiosity-ai/llm-shield</RepositoryUrl>
+    <RepositoryUrl>https://github.com/curiosity-ai/jevstral</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
     <IsPackable>false</IsPackable>
 

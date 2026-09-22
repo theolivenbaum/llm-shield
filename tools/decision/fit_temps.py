@@ -3,7 +3,7 @@
 
 Input: JSONL written by eval_td.py (margins, labels, target) from a held-out split that is not
 JevBench. Output: {"noul": T, "choice": T, "score": T, "choice:6-10": T, ...}. That is the map
-eval_jevbench.py --temps, the jevbench adapter and ShieldstralDecider all take.
+eval_jevbench.py --temps, the jevbench adapter and JevstralDecider all take.
 
 Each temperature minimises the soft cross-entropy of softmax(z / T) against the gold
 distribution. A 1-D golden-section search over log T in [0.1, 10] suffices.

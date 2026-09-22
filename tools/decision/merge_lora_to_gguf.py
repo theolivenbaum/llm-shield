@@ -6,7 +6,7 @@ W' = W + (alpha / r) * B @ A, in float32, before quantization. Nothing is writte
 but the GGUF itself. A merged bf16 checkpoint would be another 7 GiB.
 
 The result is still a Shieldstral: same architecture, same vocabulary, same verdict tokens.
-ShieldstralDecider opens it like any other GGUF.
+JevstralDecider opens it like any other GGUF.
 
   python3 merge_lora_to_gguf.py MODEL_DIR ADAPTER.pt --outtype q8_0 --outfile OUT.gguf
 """

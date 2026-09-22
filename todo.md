@@ -1,150 +1,45 @@
-# todo — Shieldstral runtime for llm-shield
+# todo — Jevstral
 
-Working notes for the port. Checked items are done and covered by tests; the
-"verified by" column names what would catch a regression.
+Checked items are done and covered by tests or by a committed measurement.
 
-## 1. Project scaffold
+## 1. Decisions
 
-- [x] `net10.0` library `LlmShield.Shieldstral`, no native dependencies
-- [x] xunit test project, fixtures copied to the test output
-- [x] `shieldstral` CLI (`download`, `moderate`, `inspect`, `tokenize`, `dump`, `bench`)
-- [x] `LlmShield.slnx`, `Directory.Build.props` (server GC, tiered PGO, unsafe on)
-- [x] TensorSharp's BSD-3-Clause licence carried in `third-party/TensorSharp-LICENSE`,
-      and every file derived from it says so in its header
+- [x] `JevstralDecider`: noul / choice / score from the verdict. One read per option,
+      softmax over log-odds, noul read as a contrast. → `DeciderTests`
+- [x] One pass per decision: trunk plus branches (`ForwardTreeAsync`), bit-identical to
+      running each branch alone. → `DeciderTests.BranchesMatchRunningEachContinuationAlone`
+- [x] `jev decide` over JevBench-format JSONL, and `--serve` for a persistent harness
+- [x] PyTorch research path in `tools/decision` that matches the C# margins (about 0.05
+      on Q8_0 vs bf16)
+- [x] Zero-shot on public JevBench: easy 0.979, standard 0.778, hard 0.396 (shared-prefix
+      order)
+- [ ] LoRA v1 (typed-decisions + synthetic): evaluate on public JevBench and on the
+      typed-decisions test split, against laya's 0.766
+- [ ] Temperatures fitted on non-JevBench held-out data, shipped with the model
+- [ ] Merge the adapter into a GGUF and check C# parity on it
+- [ ] A dedicated decision head in place of the LM head's yes/no rows: one 3072-wide
+      vector, initialised to e_yes − e_no so step 0 is the verdict, trained with the
+      adapter, stored in the GGUF as `jev.head.*`
+- [ ] Early exit: measure the verdict read from intermediate layers. If a head on layer
+      ~18 holds up, a decision costs 70% of a pass.
+- [ ] An act / abstain signal like laya's `act_head`, from the calibration features
+      (top-1, margin, entropy, k)
+- [ ] Publish Jevstral GGUFs next to the base ones on models.curiosity.ai
+- [ ] A JevBench submission: held-out tiers can only be run by the maintainers, and
+      training on the synthetic families must be disclosed (see tools/decision/README.md)
 
-## 2. GGUF
+## 2. Runtime
 
-- [x] Memory-mapped reader — metadata, tensor table, all GGUF value types
-- [x] Truncated-file detection up front (a partial download otherwise fails as an
-      access violation inside a dequantizer)
-- [x] Block geometry table for every `ggml_type` — verified by `GgufReaderTests`
-- [x] Weights read straight out of the mapping; nothing is copied at load
-
-## 3. Quantization — every type GGUF can carry
-
-Reading is complete. Writing is the converter's job and covers what the reference
-`gguf` package can write (see §5).
-
-| family | types | dequantize | verified by |
-|---|---|---|---|
-| float | F32, F16, BF16, F64 | [x] | `DequantizerParityTests` |
-| integer | I8, I16, I32, I64 | [x] | `DequantizerParityTests.DequantizeIntegerTypes` |
-| legacy | Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1 | [x] | parity + synthetic blocks |
-| k-quant | Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K | [x] | parity + synthetic blocks |
-| i-quant | IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS | [x] | parity + synthetic blocks |
-| ternary | TQ1_0, TQ2_0 | [x] read only | parity + synthetic blocks |
-| microscaling | MXFP4 | [x] | parity + synthetic blocks |
-
-- [x] i-quant codebooks generated from the reference package rather than
-      transcribed by hand (`tools/gen_quant_grids.py`)
-- [x] Fixtures cover both real quantizer output and random bytes, so sign masks
-      and codebook indices no realistic weight would produce are still exercised
-- [ ] Optional: k-quant/i-quant *writing*, so the repo can quantize without the
-      Python `gguf` package. Not needed to run the model; reading is what matters.
-
-## 4. Tokenizer
-
-- [x] Tekken pre-tokenizer regex (`\p{N}` singly, punctuation runs absorbing `/`)
-- [x] GPT-2 byte alphabet encode/decode
-- [x] Control markers matched literally, longest-first, before any merging
-- [x] Priority-queue BPE with stale-candidate rejection
-- [x] Token-identical to `mistral-common`-style segmentation on the reference
-      prompts and on pre-tokenizer edge cases — verified by `TokenizerParityTests`
-
-## 5. Conversion
-
-- [x] `tools/download_shieldstral.py`: fetches only the files the converter opens
-      (~7.2 GiB rather than the full repository's ~15 GB, which carries the same
-      weights in both Mistral and Hugging Face layouts), resumable and size-verified
-- [x] `tools/convert_shieldstral_to_gguf.py`: Mistral format → GGUF, no
-      permutation of wq/wk (the checkpoint is already in ggml's RoPE layout)
-- [x] Tekken vocabulary → GGUF tokens/types + derived merge table
-- [x] YaRN and llama-4 metadata written under llama.cpp's key names
-- [x] Pixtral vision tower → `mmproj` GGUF (`--vision`)
-- [x] Output types: f32, f16, bf16, q8_0, q5_1, q5_0, q4_1, q4_0, mxfp4
-- [x] Ternary (TQ1_0/TQ2_0) removed as a conversion target: post-hoc ternary
-      quantization scored 0.031 where every other build scores 0.997. Still
-      readable, just not producible here.
-
-## 6. Model
-
-- [x] RMSNorm (float64 reduction), SwiGLU, softmax, grouped-query attention
-- [x] YaRN RoPE — one frequency table shared by prefill and decode
-- [x] `mscale`/`mscale_all_dim` cancelling to 1.0 for `"apply_scale": false`
-- [x] Llama-4 attention temperature
-- [x] Tied LM head, evaluated only at the last position
-- [x] Grow-on-demand KV cache
-- [x] Layer-by-layer parity against the NumPy reference — `ActivationParityTests`
-- [x] Scores match NumPy *and* llama.cpp on all six reference cases —
-      `ModerationScoreTests`
-
-## 7. Fixed-system-prompt cache
-
-- [x] `SystemPromptCache`: capture, restore, save, load
-- [x] Fingerprint over (model file identity, cache geometry, prefix tokens), so a
-      stale snapshot is refused rather than silently applied
-- [x] On by default in `ShieldstralModerator`; optional on-disk persistence
-- [x] Cached and uncached paths produce *bit-identical* logits —
-      `SystemPromptCacheTests`
-
-## 8. Performance
-
-- [x] Weight-stationary GEMM: each weight row decoded once per call, token-tiled
-      so the activations stay in cache
-- [x] `TensorPrimitives` for dot/sigmoid/softmax/elementwise; `Vector<T>` for the
-      fused shapes it has no single call for
-- [x] Attention parallel over heads, GEMM parallel over row blocks
-- [x] Numerically stable softmax — `TensorPrimitives.SoftMax` skips the max-shift
-      and overflows on this model's layer-24 attention scores
-- [x] Integer dot products against Q8-quantized activations, for the types with a
-      single per-block scale — `IntegerDot`, selected by `QuantMatMul.Strategy`
-- [x] AVX2 `vpmaddubsw`/`vpmaddwd` kernel with a portable fallback; unpack once
-      per row and reduce once per row, both of which the first attempt got wrong
-      and both of which cost more than the arithmetic itself
-- [ ] Integer kernels for the k-quants. They carry per-sub-block scales, so each
-      family needs its own unpack; the float path covers them correctly today.
-- [ ] Persist the prefix cache next to the model by default rather than opt-in.
-
-## 9. Benchmarks
-
-- [x] Single-execution harness: environment, per-type dequantize throughput,
-      float-vs-integer matmul, end-to-end sweep per strategy (`shieldstral bench`)
-- [x] Adaptive sample length and minimum-of-N, so a one-token matmul is not timed
-      against the scheduler's mood
-- [x] Prefill and decode tokens/s, resident memory and managed allocation per
-      quantization, with the safety score alongside so accuracy loss is visible
-- [ ] Track the numbers over time rather than pasting them into the README
-
-## 10. Distribution
-
-- [x] `ModelDownloader`: fetches the Q5_1/Q5_0/Q4_0 builds published at
-      models.curiosity.ai, with progress reporting and a one-call
-      `ShieldstralModerator.CreateAsync`
-- [x] Resumable across process restarts — `.download` sidecar renamed into place
-      only when complete, so a file that exists is always loadable
-- [x] A partial file is only reused when the size *and* entity tag still match the
-      server; a republished model restarts the download instead of splicing
-- [x] Size and range support learned from a one-byte ranged GET, because the host
-      answers HEAD with 405
-- [x] Free-space check before starting, and a disk-full failure that says so
-      instead of retrying eight times
-- [x] `LlmShield.Shieldstral` packs for NuGet (README and TensorSharp's licence
-      included); `.devops/azure-pipelines.yml` builds, tests and pushes on `main`
-- [ ] Publish an mmproj alongside the three text models, once the vision path runs
-
-## 11. Vision
-
-- [x] Converter emits the Pixtral tower and projector
-- [x] `[IMG]` placement in the prompt template — `ChatTemplateTests`
-- [ ] Pixtral encoder forward pass (patch conv, 2-D RoPE, patch merger, projector)
-- [ ] Image preprocessing (resize to longest edge 1540, CLIP normalisation)
-- [ ] Expanding `[IMG]` into patch tokens and injecting the embeddings
-
-Text moderation is complete and validated; the vision path is converted but not
-yet executed. `ShieldstralModerator` is text-only today.
-
-## 12. Documentation
-
-- [x] `README.md` — what it is, how to convert, how to run
-- [x] `CLAUDE.md` — layout, invariants, how to regenerate fixtures
-- [x] This file
+- [x] GGUF reader, every quantization type, tokenizer, Ministral-3 forward, and parity
+      with NumPy and llama.cpp (inherited from the Shieldstral runtime)
+- [x] `PanelGemm` prefill: 120–129 GFLOP/s single-threaded at 256 tokens, up from 15–18
+- [x] AVX-512 dequantizers for the legacy quants
+- [x] Transposed-key, query-tiled attention
+- [x] Verdict-rows-only LM head
+- [ ] Long prompts: a 4k-token decision is ~90 s on 4 cores. The FLOPs say about 60.
+      Attention is O(n²) and still streams the transposed keys per query tile; a
+      flash-style key-blocked loop is the next step.
+- [ ] int8 with VNNI (`vpdpbusd`) for the panel GEMM: halves the weight traffic and doubles
+      the MACs per instruction against float, at the int8 path's 3e-3 error
+- [ ] Integer kernels for the k-quants
+- [ ] Vision: the converter emits the Pixtral tower, but its forward pass is not implemented

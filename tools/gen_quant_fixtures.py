@@ -30,7 +30,7 @@ from gguf.quants import dequantize, quantize, _type_traits
 
 OUT_DEFAULT = Path(__file__).resolve().parent.parent / "tests/fixtures/quantization.json"
 
-# Every type LlmShield.Shieldstral.Quantization.Dequantizer.Supports() returns true
+# Every type Jevstral.Quantization.Dequantizer.Supports() returns true
 # for. F32/F16/BF16 and the integer types are handled by gguf directly.
 TYPES = [
     T.F32, T.F16, T.BF16,

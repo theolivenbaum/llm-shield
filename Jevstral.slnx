@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="src/Jevstral/Jevstral.csproj" />
+  <Project Path="src/Jevstral.Cli/Jevstral.Cli.csproj" />
+  <Project Path="tests/Jevstral.Tests/Jevstral.Tests.csproj" />
+</Solution>
