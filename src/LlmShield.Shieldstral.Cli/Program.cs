@@ -28,6 +28,7 @@ internal static class Program
             {
                 "download" => await Download(args[1..]).ConfigureAwait(false),
                 "moderate" => await Moderate(args[1..]).ConfigureAwait(false),
+                "decide" => await Decide.Run(args[1..]).ConfigureAwait(false),
                 "inspect" => Inspect(args[1..]),
                 "tokenize" => Tokenize(args[1..]),
                 "dump" => await Dump(args[1..]).ConfigureAwait(false),
@@ -68,6 +69,8 @@ internal static class Program
           moderate <model.gguf> --instruct TEXT --query TEXT --document TEXT [--json]
                                 [--document-file PATH] [--no-prefix-cache] [--prefix-cache PATH]
                                 [--threads N]
+          decide   <model.gguf> --tasks FILE.jsonl [--out FILE.jsonl] [--temps FILE.json]
+                   [--limit N] [--threads N]         typed decisions (noul/choice/score)
           inspect  <model.gguf>                          print metadata and tensor summary
           tokenize <model.gguf> <text>                   print token ids and pieces
           dump     <model.gguf> <prompt-file> <out.json> record activations for parity checks
