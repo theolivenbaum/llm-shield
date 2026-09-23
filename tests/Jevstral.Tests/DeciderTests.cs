@@ -90,6 +90,30 @@ public class DeciderTests
         }
     }
 
+    /// <summary>
+    /// With a fixed question and changing data, the instruction and option list stay in the cache
+    /// between calls. Reusing them must change nothing: a warm decider and a cold one give
+    /// bit-identical margins.
+    /// </summary>
+    [Fact]
+    public async Task ReusingTheQuestionPrefixIsBitIdentical()
+    {
+        if (Fixtures.ModelPath is not { } path) { _output.WriteLine("JEVSTRAL_MODEL is not set; skipping"); return; }
+        const string first = "Policy: refunds require a receipt. The customer has a receipt.";
+        const string second = "Policy: refunds require a receipt. The customer has no receipt.";
+
+        using var warm = await JevstralDecider.OpenAsync(path);
+        await warm.DecideAsync(Refund, first);
+        DecisionResult reused = await warm.DecideAsync(Refund, second);
+
+        using var cold = await JevstralDecider.OpenAsync(path);
+        DecisionResult fresh = await cold.DecideAsync(Refund, second);
+
+        _output.WriteLine($"reused {reused.CachedTokens} of {reused.PrefixTokens} prefix tokens (cold: {fresh.CachedTokens})");
+        Assert.True(reused.CachedTokens > fresh.CachedTokens, "the question prefix was not reused");
+        Assert.Equal(fresh.Margins, reused.Margins);
+    }
+
     [Fact]
     public async Task ADecisionIsADistributionOverItsOptions()
     {

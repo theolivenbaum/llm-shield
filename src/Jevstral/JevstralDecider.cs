@@ -66,6 +66,9 @@ public sealed record DecisionResult(
     int PrefixTokens,
     int SuffixTokens)
 {
+    /// <summary>Leading prompt tokens reused from the previous call's cache rather than recomputed.</summary>
+    public int CachedTokens { get; init; }
+
     public string Label => Labels[Kernels.ArgMax(Probabilities)];
     public float Confidence => Probabilities.Max();
     public float ProbabilityOf(string label) => Probabilities[IndexOf(label)];
@@ -116,6 +119,9 @@ public sealed class JevstralDecider : IDisposable
     private readonly int[] _verdictRows;
     private readonly IReadOnlyDictionary<string, float> _temperature;
     private SystemPromptCache? _system;
+
+    /// <summary>The trunk tokens whose keys and values occupy the cache's leading slots.</summary>
+    private int[] _resident = [];
     private readonly DecisionLayout _layout;
 
     /// <summary>The prompt layout this instance renders; an adapter is only valid for the one it was trained on.</summary>
@@ -158,6 +164,7 @@ public sealed class JevstralDecider : IDisposable
             int[] system = [.. decider._model.Tokenizer.Encode(SystemBlock, addSpecial: true)];
             decider._system = await SystemPromptCache.CaptureAsync(decider._model, system, decider._options)
                 .ConfigureAwait(false);
+            decider._resident = system;
             return decider;
         }
         catch
@@ -211,8 +218,17 @@ public sealed class JevstralDecider : IDisposable
         ParallelOptions po = options ?? _options;
 
         int[] prefix = [.. _model.Tokenizer.Encode(RenderPrefix(question, state, _layout), addSpecial: true)];
-        int start = 0;
-        if (_system is not null && _system.IsPrefixOf(prefix))
+
+        // The previous call's trunk is still in the cache. Whatever leading tokens this prompt
+        // shares with it (the system prompt, and with the same question the whole instruction and
+        // option list) are reused as they are: truncate to the common prefix and run only the rest.
+        // Every kernel is batch-invariant, so this is bit-identical to running the trunk whole.
+        int start = CommonPrefix(prefix, _resident);
+        if (start > 0 && start >= (_system?.TokenCount ?? 0))
+        {
+            _model.KvCache.Truncate(start);
+        }
+        else if (_system is not null && _system.IsPrefixOf(prefix))
         {
             _system.RestoreInto(_model);
             start = _system.TokenCount;
@@ -220,7 +236,11 @@ public sealed class JevstralDecider : IDisposable
         else
         {
             _model.ResetKvCache();
+            start = 0;
         }
+        // Never run an empty trunk when the whole prefix matches: re-run its last token so the
+        // branches still follow a token computed in this pass's layout.
+        if (start == prefix.Length) { start--; _model.KvCache.Truncate(start); }
 
         // The prefix and every option's query in one pass: a causal trunk, then one branch per
         // option, reading only the verdict rows of the LM head.
@@ -234,6 +254,7 @@ public sealed class JevstralDecider : IDisposable
         float[][] verdicts = await _model.ForwardTreeAsync(prefix.AsMemory(start), branches, _verdictRows, po)
             .ConfigureAwait(false);
         _model.KvCache.Truncate(prefix.Length);
+        _resident = prefix;
 
         var margins = new float[branches.Length];
         for (int i = 0; i < margins.Length; i++)
@@ -243,7 +264,10 @@ public sealed class JevstralDecider : IDisposable
         var probs = new float[margins.Length];
         for (int i = 0; i < probs.Length; i++) probs[i] = margins[i] / t;
         Kernels.Softmax(probs);
-        return new DecisionResult([.. question.Options.Select(o => o.Label)], probs, margins, prefix.Length, suffixTokens);
+        return new DecisionResult([.. question.Options.Select(o => o.Label)], probs, margins, prefix.Length, suffixTokens)
+        {
+            CachedTokens = start,
+        };
     }
 
     private float TemperatureFor(DecisionQuestion q)
@@ -254,6 +278,13 @@ public sealed class JevstralDecider : IDisposable
         if (_temperature.TryGetValue($"{type}:{bucket}", out float t) || _temperature.TryGetValue(type, out t))
             return MathF.Max(t, 1e-3f);
         return 1f;
+    }
+
+    private static int CommonPrefix(int[] a, int[] b)
+    {
+        int n = Math.Min(a.Length, b.Length), i = 0;
+        while (i < n && a[i] == b[i]) i++;
+        return i;
     }
 
     private static float Best(float[] logits, int start, int count)

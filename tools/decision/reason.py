@@ -100,7 +100,10 @@ class Batch:
         self.len += T
         return h[:, -1]
 
-    def prefill(self, chunk=512):
+    def prefill(self, chunk=128):
+        # Attention over a chunk materialises [rows, heads, chunk, context] fp32 scores: at 512
+        # tokens against a 5k context that was 1.3 GB per call, enough to push the memory-mapped
+        # weights out of the page cache.
         h = None
         for c in range(0, self.ids.shape[1], chunk):
             h = self.step(self.ids[:, c:c + chunk])
@@ -234,7 +237,12 @@ def main():
             cur.append(x)
         if cur:
             batches.append(cur)
+        import ctypes
+        import gc
+        libc = ctypes.CDLL("libc.so.6")
         for chunk in batches:
+            gc.collect()
+            libc.malloc_trim(0)
             t0 = time.time()
             prompts, labs = [], []
             for tier, t in chunk:

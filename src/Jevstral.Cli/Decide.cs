@@ -85,6 +85,7 @@ internal static class Decide
                 ["expected"] = expected,
                 ["correct"] = ok,
                 ["prefix_tokens"] = result.PrefixTokens,
+                ["cached_tokens"] = result.CachedTokens,
                 ["suffix_tokens"] = result.SuffixTokens,
                 ["latency_s"] = seconds,
             }.ToJsonString());
