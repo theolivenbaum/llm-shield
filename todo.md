@@ -24,7 +24,7 @@ Checked items are done and covered by tests or by a committed measurement.
       ~18 holds up, a decision costs 70% of a pass.
 - [ ] An act / abstain signal like laya's `act_head`, from the calibration features
       (top-1, margin, entropy, k)
-- [ ] Publish Jevstral GGUFs next to the base ones on models.curiosity.ai
+- [x] Publish Jevstral GGUFs on models.curiosity.ai/jevstral/ (all six plus SYSTEM_PROMPT and SHA256SUMS; Q8_0 checksums verified against a local build)
 - [ ] A JevBench submission: held-out tiers can only be run by the maintainers, and
       training on the synthetic families must be disclosed (see tools/decision/README.md)
 
