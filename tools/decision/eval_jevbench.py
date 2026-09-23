@@ -129,7 +129,7 @@ def main():
     ap.add_argument("--out")
     ap.add_argument("--report")
     ap.add_argument("--mode", default="verify", choices=["verify", "list"])
-    ap.add_argument("--layout", default="docfirst", choices=["docfirst", "card"])
+    ap.add_argument("--layout", default="docfirst", choices=["docfirst", "card", "qcache"])
     ap.add_argument("--style", default="listed", choices=["listed", "bare"])
     ap.add_argument("--noul", default="contrast", choices=["contrast", "direct"])
     ap.add_argument("--tiers", default="easy,original,hard")

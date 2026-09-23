@@ -150,7 +150,7 @@ class Shieldstral(nn.Module):
         return out.to(x.dtype)
 
     def forward(self, ids: torch.Tensor, valid: torch.Tensor | None = None, past=None,
-                grad_from: int = 0):
+                grad_from: int = 0, mask: torch.Tensor | None = None, positions: torch.Tensor | None = None):
         """
         ids   [B, T] tokens, right-padded; valid [B, T] bool (True = real token).
         past  None, or (kv list, prefix_len) from `prefix()`, with batch 1 (shared) or B.
@@ -162,14 +162,14 @@ class Shieldstral(nn.Module):
         if valid is None:
             valid = torch.ones(B, T, dtype=torch.bool)
         P = 0 if past is None else past[1]
-        pos = (P + torch.arange(T))[None].expand(B, T)
+        pos = (P + torch.arange(T))[None].expand(B, T) if positions is None else positions
 
         # Attention mask [B, 1, T, P+T]: the whole prefix, plus a causal mask over valid suffix tokens.
         causal = torch.tril(torch.ones(T, T, dtype=torch.bool))
         m = causal[None] & valid[:, None, :]
         if P:
             m = torch.cat([torch.ones(B, T, P, dtype=torch.bool), m], dim=-1)
-        m = m[:, None]
+        m = m[:, None] if mask is None else mask
 
         h = self.embed[ids]
         new_kv = []

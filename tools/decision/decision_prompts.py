@@ -96,6 +96,11 @@ def build_reads(q: dict, labels: list[str], state, layout: str = "docfirst", sty
             queries.append(f"Is {noun} {lab}{d} the correct answer to the question?")
         kind = "softmax"
 
+    if layout == "qcache":
+        # Pieces for the cached-query layout; engine.Decider assembles the attention mask.
+        prefix = f"{SYSTEM_BLOCK}[INST]<Instruct>: {instruct}"
+        queries_text = [f"\n\n<Query>: {qq}" for qq in queries]
+        return (prefix, queries_text, f"\n\n<Document>: {doc}"), None, kind
     if layout == "docfirst":
         prefix = f"{SYSTEM_BLOCK}[INST]<Instruct>: {instruct}\n\n<Document>: {doc}"
         suffixes = [f"\n\n<Query>: {qq}[/INST]" for qq in queries]

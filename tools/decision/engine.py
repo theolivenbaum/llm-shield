@@ -52,8 +52,59 @@ class Decider:
         last = torch.tensor([len(s) - 1 for s in suffix_ids])
         return h[torch.arange(n), last]
 
+    def margins_qcache(self, q, labels, state, grad_from: int = 0):
+        """
+        The cached-query layout, as one masked pass:
+            [prefix] [query 1] … [query N] [document] [v1] … [vN]
+        Queries branch off the prefix (and see neither each other nor the document), the document
+        sees only the prefix, and verdict token i ([/INST]) sees the prefix, query i, the document
+        and itself. Queries are right-aligned in position, so from each verdict token the order
+        prefix, query, document, verdict is contiguous, as in the model card's layout.
+        Everything but the document and the N verdict tokens is fixed per question, and cacheable.
+        """
+        (prefix, queries, doc), _, kind = build_reads(q, labels, self.clip(state), "qcache", self.style, self.noul)
+        p = self.m.encode(prefix, bos=True)
+        qs = [self.m.encode(x) for x in queries]
+        d = self.m.encode(doc)
+        v = self.m.encode("[/INST]")
+        assert len(v) == 1
+        n, lmax = len(qs), max(len(x) for x in qs)
+        ids = p + [t for x in qs for t in x] + d + v * n
+        T = len(ids)
+        pos = list(range(len(p)))
+        spans = []
+        start = len(p)
+        for x in qs:
+            pos += list(range(len(p) + lmax - len(x), len(p) + lmax))
+            spans.append((start, start + len(x)))
+            start += len(x)
+        d0 = start
+        pos += list(range(len(p) + lmax, len(p) + lmax + len(d)))
+        vpos = len(p) + lmax + len(d)
+        pos += [vpos] * n
+        mask = torch.zeros(T, T, dtype=torch.bool)
+        P = len(p)
+        mask[:P, :P] = torch.ones(P, P, dtype=torch.bool).tril()
+        for a, b in spans:
+            mask[a:b, :P] = True
+            mask[a:b, a:b] = torch.ones(b - a, b - a, dtype=torch.bool).tril()
+        mask[d0:d0 + len(d), :P] = True
+        mask[d0:d0 + len(d), d0:d0 + len(d)] = torch.ones(len(d), len(d), dtype=torch.bool).tril()
+        vs = d0 + len(d)
+        for i, (a, b) in enumerate(spans):
+            r = vs + i
+            mask[r, :P] = True
+            mask[r, a:b] = True
+            mask[r, d0:d0 + len(d)] = True
+            mask[r, r] = True
+        h, _ = self.m(torch.tensor([ids]), mask=mask[None, None], positions=torch.tensor([pos]), grad_from=grad_from)
+        hv = h[0, vs:vs + n]
+        return self.m.verdict(hv), kind, hv
+
     def margins(self, q, labels, state, grad_from: int = 0):
         """Yes-minus-no log-odds for each read of this decision, and the read kind."""
+        if self.layout == "qcache":
+            return self.margins_qcache(q, labels, state, grad_from)
         prefix, suffixes, kind = build_reads(q, labels, self.clip(state), self.layout, self.style, self.noul)
         past = self.run_prefix(self.encode_prefix(prefix), grad_from)
         sfx = [self.m.encode(s) for s in suffixes]
