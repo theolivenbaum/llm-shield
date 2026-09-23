@@ -72,6 +72,18 @@ public sealed class ReasoningDecider : IDisposable
     public static ReasoningDecider Open(string ggufPath, string systemPrompt, ParallelOptions? options = null)
         => new(new MinistralModel(ggufPath, initialCacheCapacity: 4096), systemPrompt.Trim(), options ?? new ParallelOptions());
 
+    /// <summary>Downloads the published reasoning checkpoint and its system prompt if needed, then opens it.</summary>
+    public static async Task<ReasoningDecider> CreateAsync(
+        JevstralQuantization quantization = JevstralQuantization.Q8_0, string? downloadToPath = null,
+        ParallelOptions? options = null, Action<DownloadProgress>? reportProgress = null,
+        CancellationToken cancellationToken = default)
+    {
+        string path = await JevstralModels.EnsureAsync(JevstralModel.Reasoning, quantization, downloadToPath,
+            reportProgress, cancellationToken).ConfigureAwait(false);
+        string system = await JevstralModels.EnsureReasoningSystemPromptAsync(path, cancellationToken).ConfigureAwait(false);
+        return Open(path, system, options);
+    }
+
     /// <summary>The prompt, up to and including the opening <c>[THINK]</c>.</summary>
     public string RenderPrompt(DecisionQuestion question, string state)
     {

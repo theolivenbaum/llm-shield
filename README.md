@@ -100,10 +100,29 @@ runner and scoring.
 
 ## Models
 
-A GGUF is the whole model. `download` fetches the base Shieldstral builds from
-models.curiosity.ai. `tools/convert_shieldstral_to_gguf.py` converts the original weights.
-`tools/decision/merge_lora_to_gguf.py` folds a trained adapter in. Every GGUF type is
-readable:
+A Jevstral deployment is two GGUFs:
+
+| file | what it is | used by |
+|---|---|---|
+| `Jevstral-1.0-3B-<Q>.gguf` | Shieldstral 1.0 3B with the Jevstral adapter folded in | `JevstralDecider`, `jev decide` |
+| `Ministral-3-3B-Reasoning-<Q>.gguf` (+ `.SYSTEM_PROMPT.txt`) | Mistral's reasoning checkpoint, unchanged | `ReasoningDecider`, `jev reason` |
+
+`JevstralDecider.CreateAsync()` and `ReasoningDecider.CreateAsync()` download them from
+`https://models.curiosity.ai/jevstral/` (override with `JEVSTRAL_MODEL_BASE_URL`) and cache them.
+To build them:
+
+```bash
+pip install numpy safetensors gguf
+tools/build_models.sh ~/jevstral "q8_0 q5_1 q4_0"      # add --clean as a third argument to drop the bf16 downloads
+```
+
+The script fetches both public checkpoints from Hugging Face, folds `adapters/jevstral-v1` (the
+LoRA, 11.4M parameters in fp16, committed here) into Shieldstral, converts both models, and
+writes `SHA256SUMS`. It needs no PyTorch and no GPU. It does need about 15 GiB of disk for the
+downloads plus the outputs, and about 6 GB of RAM. With the .NET SDK installed, it also
+smoke-tests one decision. Upload the contents of the output directory as they are.
+
+Every GGUF type is readable:
 
 ```
 F32 F16 BF16 F64  I8 I16 I32 I64
@@ -113,9 +132,8 @@ IQ1_S IQ1_M IQ2_XXS IQ2_XS IQ2_S IQ3_XXS IQ3_S IQ4_NL IQ4_XS
 TQ1_0 TQ2_0 MXFP4
 ```
 
-Each type is checked against the reference `gguf` package. Weights stay quantized in the
-memory-mapped file: a 3.4 GiB checkpoint loads instantly and costs its on-disk size in
-shared page cache.
+Weights stay quantized in the memory-mapped file: a 3.4 GiB checkpoint loads instantly and costs its
+on-disk size in shared page cache.
 
 ## Validation
 

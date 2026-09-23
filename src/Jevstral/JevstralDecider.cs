@@ -190,6 +190,20 @@ public sealed class JevstralDecider : IDisposable
         }
     }
 
+    /// <summary>
+    /// Downloads the published Jevstral decider if it is not cached yet, then opens it: the whole
+    /// deployment in one call. A cached file opens without touching the network.
+    /// </summary>
+    public static async Task<JevstralDecider> CreateAsync(
+        JevstralQuantization quantization = JevstralQuantization.Q8_0, string? downloadToPath = null,
+        IReadOnlyDictionary<string, float>? temperature = null, ParallelOptions? options = null,
+        Action<DownloadProgress>? reportProgress = null, CancellationToken cancellationToken = default)
+    {
+        string path = await JevstralModels.EnsureAsync(JevstralModel.Decider, quantization, downloadToPath,
+            reportProgress, cancellationToken).ConfigureAwait(false);
+        return await OpenAsync(path, temperature, options).ConfigureAwait(false);
+    }
+
     private static string SystemBlock
         => ChatTemplate.SystemOpen + VerdictScorer.SystemPrompt + ChatTemplate.SystemClose;
 

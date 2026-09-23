@@ -46,6 +46,7 @@ REQUIRED = [
 # Small, and worth having next to the weights: the prompt template the runtime
 # reproduces, plus the model card and the configs that document the architecture.
 OPTIONAL = [
+    "SYSTEM_PROMPT.txt",        # the reasoning checkpoints' trained system prompt (Ministral-3 *-Reasoning)
     "chat_template.jinja",
     "config.json",
     "generation_config.json",

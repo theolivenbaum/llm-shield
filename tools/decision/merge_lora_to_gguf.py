@@ -23,7 +23,6 @@ sys.path.insert(0, str(HERE.parent))
 sys.path.insert(0, str(HERE))
 
 import convert_shieldstral_to_gguf as conv  # noqa: E402
-from lora_io import load_lora  # noqa: E402
 
 MODULE_TO_TENSOR = {
     "wq": "attention.wq", "wk": "attention.wk", "wv": "attention.wv", "wo": "attention.wo",
@@ -32,17 +31,40 @@ MODULE_TO_TENSOR = {
 
 
 def deltas(adapter_path):
-    state, cfg = load_lora(adapter_path)
+    """
+    Per-tensor W deltas, (alpha / r) * B @ A, in float32. An exported adapter directory
+    (export_adapter.py: adapter.safetensors + adapter.json) needs only numpy and safetensors, so
+    tools/build_models.sh runs without PyTorch. A training checkpoint (.pt) needs torch.
+    """
+    path = Path(adapter_path)
+    if path.is_dir():
+        import json
+
+        from safetensors.numpy import load_file
+
+        cfg = json.loads((path / "adapter.json").read_text())["lora"]
+        state = {k: v.astype(np.float32) for k, v in load_file(str(path / "adapter.safetensors")).items()}
+    else:
+        from lora_io import load_lora
+
+        tensors, cfg = load_lora(adapter_path)
+        state = {k: v.float().numpy() for k, v in tensors.items()}
     scale = cfg.get("alpha", 16.0) / cfg["rank"]
+    # Only the rank-r factors are kept; each dense delta is formed when its tensor is converted.
+    # All 84 of them at once would be ~6 GB of float32.
     out = {}
     for name, a in state.items():
         if not name.endswith(".lora_a"):
             continue
         prefix = name[: -len(".lora_a")]            # layers.14.wq
         _, layer, module = prefix.split(".")
-        b = state[prefix + ".lora_b"]
-        out[f"layers.{layer}.{MODULE_TO_TENSOR[module]}.weight"] = (b.float() @ a.float()).numpy() * scale
+        out[f"layers.{layer}.{MODULE_TO_TENSOR[module]}.weight"] = (state[prefix + ".lora_b"], a, scale)
     return out
+
+
+def dense(factors):
+    b, a, scale = factors
+    return (b @ a) * scale
 
 
 def main():
@@ -59,9 +81,10 @@ def main():
 
     def get_tensor(self, name):
         w = original(self, name)
-        d = merge.get(name)
-        if d is None:
+        f = merge.get(name)
+        if f is None:
             return w
+        d = dense(f)
         rel = float(np.linalg.norm(d) / max(np.linalg.norm(w), 1e-12))
         print(f"    + delta {name} (relative norm {rel:.2e})")
         return (w.astype(np.float32) + d.astype(np.float32)).astype(np.float32)
