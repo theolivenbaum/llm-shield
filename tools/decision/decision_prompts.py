@@ -53,7 +53,7 @@ def option_lines(qtype: str, labels: list[str], criteria) -> list[tuple[str, str
 
 
 def build_reads(q: dict, labels: list[str], state, layout: str = "docfirst", style: str = "listed",
-                noul: str = "contrast", query: str = "full"):
+                noul: str = "contrast", query: str = "short"):
     """
     Returns (prefix, suffixes, kind). `kind` says how to turn the verdicts into probabilities:
     "binary" (one read, noul) or "softmax" (one read per label, in label order).

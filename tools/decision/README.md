@@ -38,7 +38,7 @@ Exactly one of these answers is correct:
 …
 
 <Document>: <state>                                    ← shared prefix, prefilled once
-\n\n<Query>: Is option <label> (<criterion>) the correct answer to the question?[/INST]   ← one per option
+\n\n<Query>: Is option <label> correct?[/INST]   ← one per option
 ```
 
 Each option gives a log-odds z_i = logit(yes) − logit(no), and the probabilities are
@@ -57,6 +57,11 @@ softmax(z / T). Three findings shaped this:
   to re-read the document. Instruct, Document, Query lets all options share the document
   prefix, the only affordable way to run a 9-way choice over a 4k-token policy on a CPU. The
   adapter is trained on this order.
+- **The per-option query only names the option.** Its criterion is already listed in the
+  instruction. With the v1 adapter, "Is option X correct?" scores 1.000 / 0.847 on easy /
+  standard, against 0.979 / 0.819 when the query restates the criterion, and its branch is a third
+  as long. Moving the queries before the document (`qcache`, one token per option) keeps accuracy
+  (0.958 / 0.847) but is badly overconfident (ECE 0.41 / 0.34).
 
 ## Reproducing
 

@@ -12,7 +12,7 @@ PREFIX_CHUNK = 1024
 
 class Decider:
     def __init__(self, model, layout="docfirst", style="listed", temperature=None, max_state_tokens=None,
-                 noul="contrast", query="full"):
+                 noul="contrast", query="short"):
         self.noul = noul
         self.query = query
         self.m = model

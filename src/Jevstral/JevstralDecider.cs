@@ -219,8 +219,11 @@ public sealed class JevstralDecider : IDisposable
         DecisionLayout layout = DecisionLayout.SharedDocument, string? state = null)
     {
         string noun = question.Type == DecisionType.Score ? "level" : "option";
-        string d = option.Description.Length > 0 ? $" ({option.Description})" : "";
-        string query = $"\n\n<Query>: Is {noun} {option.Label}{d} the correct answer to the question?";
+        // Only the option's name: its criterion is already listed in the cached instruction, and
+        // this branch is the one piece of work per option that no cache can share. Measured with
+        // the v1 adapter on public easy / standard: 1.000 / 0.847, against 0.979 / 0.819 when the
+        // branch restated the criterion (~27 tokens instead of ~8).
+        string query = $"\n\n<Query>: Is {noun} {option.Label} correct?";
         return layout == DecisionLayout.PerOption
             ? $"{query}\n\n<Document>: {state}{ChatTemplate.InstructionClose}"
             : $"{query}{ChatTemplate.InstructionClose}";

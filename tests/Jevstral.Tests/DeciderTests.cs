@@ -34,7 +34,7 @@ public class DeciderTests
             "\n- option yes: Every required condition is established." +
             "\n\n<Document>: Policy: refunds need a receipt. No receipt.", prefix);
         Assert.Equal(
-            "\n\n<Query>: Is option yes (Every required condition is established.) the correct answer to the question?[/INST]",
+            "\n\n<Query>: Is option yes correct?[/INST]",
             JevstralDecider.RenderSuffix(Refund, Refund.Options[1]));
     }
 
@@ -46,7 +46,7 @@ public class DeciderTests
         Assert.DoesNotContain("<Document>", prefix);
         Assert.EndsWith("\n- option yes: Every required condition is established.", prefix);
         Assert.Equal(
-            "\n\n<Query>: Is option no (A condition is missing or a prohibition applies.) the correct answer to the question?" +
+            "\n\n<Query>: Is option no correct?" +
             "\n\n<Document>: " + state + "[/INST]",
             JevstralDecider.RenderSuffix(Refund, Refund.Options[0], DecisionLayout.PerOption, state));
     }

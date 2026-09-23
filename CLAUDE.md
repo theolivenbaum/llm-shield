@@ -295,8 +295,19 @@ answer?", and runs a softmax over the per-option log-odds. A noul is read as a t
 choice between its false and true criteria. Asking it directly leaves a topical yes-bias
 (easy-tier fact accuracy: 0.58 direct, 0.92 as a contrast).
 
-The prefix is the instruction plus the document. Each option's query is a branch of one
-`ForwardTreeAsync` pass, so a decision costs one pass whatever the number of options. The
+The cache is layered for the usual case, a fixed question over many inputs:
+1. **The question** (system prompt, instruction, option list) stays resident between calls. A
+   small LRU of snapshots (`QuestionCacheSize`) covers several questions interleaved.
+2. **The data** runs once per call, in the trunk.
+3. **One short branch per option** ("Is option X correct?", ~8 tokens) attends to both. It is the
+   only per-option work. Restating the criterion there was ~27 tokens and scored lower (v1 adapter,
+   public easy / standard: 0.979 / 0.819 against 1.000 / 0.847).
+
+Every layer is bit-identical to a cold call
+(`DeciderTests.ReusingTheQuestionPrefixIsBitIdentical`,
+`DeciderTests.InterleavedQuestionsAreRestoredFromTheirSnapshots`). Putting the option queries
+before the data (`--layout qcache` in tools/decision) would cut layer 3 to one token, but it is
+badly overconfident (ECE 0.3–0.4), because the data never sees the option. The
 prompt must match `tools/decision/decision_prompts.py` byte for byte: that is where adapters
 are trained (`tools/decision/README.md`), and a LoRA is only valid for its prompt.
 → `DeciderTests.PrefixAndSuffixRenderTheTrainedPrompt`
