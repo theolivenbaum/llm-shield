@@ -17,6 +17,10 @@
 # No PyTorch and no GPU. Disk: 2 x 7.2 GiB for the bf16 checkpoints (in OUT_DIR/.work, removed with --clean), plus
 # about 3.4 / 2.4 / 1.8 GiB per model at Q8_0 / Q5_1 / Q4_0. RAM: ~6 GB (the conversion widens one tensor at a time,
 # the 131072 x 3072 embedding table being the largest).
+#
+# On WSL, a Windows drive (/mnt/c, /mnt/d, ...) works but is slow for the 15 GiB of downloads. Set
+# JEVSTRAL_WORK to a Linux path (e.g. ~/.cache/jevstral-build) to keep the scratch files there, and point
+# OUT_DIR wherever the results should land.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
