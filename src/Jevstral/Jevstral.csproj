@@ -1,0 +1,37 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>Jevstral</RootNamespace>
+    <AssemblyName>Jevstral</AssemblyName>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <IsPackable>true</IsPackable>
+    <PackageId>Jevstral</PackageId>
+    <Authors>Curiosity GmbH, Zhongkai Fu</Authors>
+    <Copyright>(c) Copyright 2026 Curiosity GmbH - all rights reserved, Copyright (c) Zhongkai Fu (TensorSharp)</Copyright>
+    <!-- An absolute URI, or NuGet silently drops it from the nuspec. -->
+    <PackageProjectUrl>https://curiosity.ai</PackageProjectUrl>
+    <!-- The licence and repository URL are shared; see Directory.Build.props. -->
+    <GeneratePackageOnBuild>false</GeneratePackageOnBuild>
+    <PackageRequireLicenseAcceptance>false</PackageRequireLicenseAcceptance>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <Description>Jevstral: typed, calibrated decisions (noul / choice / score) from a 3B language model, in 100% managed .NET. One forward pass per decision, every option a branch off a shared prefix. Reads GGUF weights directly (every quantization type, memory-mapped, no native library), built on Mistral's Shieldstral 1.0 3B.</Description>
+    <PackageTags>Jevstral, Jev, System One, Typed Decisions, Classifier, Calibration, Router, LLM Judge, Shieldstral, Mistral, Ministral, GGUF, Quantization, Inference, Pure CSharp, No Native Dependencies, NLP, AI</PackageTags>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="System.Numerics.Tensors" Version="10.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Jevstral.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The licence this code is carried under travels with the package, not just with the repo. -->
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" />
+    <None Include="..\..\third-party\TensorSharp-LICENSE" Pack="true" PackagePath="third-party\" />
+  </ItemGroup>
+
+</Project>

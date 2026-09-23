@@ -1,0 +1,50 @@
+{
+ "format": "jevstral-lora-v1",
+ "base": "mistralai/Shieldstral-1.0-3B (consolidated.safetensors, Mistral format)",
+ "lora": {
+  "rank": 16,
+  "alpha": 32.0,
+  "layers": [
+   14,
+   15,
+   16,
+   17,
+   18,
+   19,
+   20,
+   21,
+   22,
+   23,
+   24,
+   25
+  ],
+  "targets": [
+   "wq",
+   "wk",
+   "wv",
+   "wo",
+   "w1",
+   "w2",
+   "w3"
+  ],
+  "dropout": 0.0
+ },
+ "trained_steps": 200,
+ "training": {
+  "data": [
+   "LocalLLaMA/typed-decisions, split 'all/train', 300 cases (seed 0)",
+   "tools/decision/gen_synthetic.py --n 3000 --seed 1, 2000 items (seed 0)"
+  ],
+  "layout": "docfirst",
+  "lr": 0.0002,
+  "accum": 8,
+  "max_steps": 200,
+  "max_state_tokens": 1024,
+  "layers_from": 14,
+  "rank": 16,
+  "alpha": 32.0,
+  "seed": 0,
+  "notes": "200 updates of 8 decisions; resumed at update 125 with fresh optimizer state after a memory stall (train_lora.py --resume)."
+ },
+ "note": "LoRA v1 on the verdict. Shared-document layout; trained with full per-option queries, evaluated best with short ones. Public JevBench with this adapter (not trained on): easy 1.000, standard 0.847 (short query). LocalLLaMA/typed-decisions test (100 cases): 0.658."
+}

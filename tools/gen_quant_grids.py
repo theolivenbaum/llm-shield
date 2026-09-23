@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate src/LlmShield.Shieldstral/Quantization/QuantGrids.g.cs.
+"""Generate src/Jevstral/Quantization/QuantGrids.g.cs.
 
 The i-quant families (IQ1/IQ2/IQ3) do not store weights directly: each group of
 4 or 8 weights is an index into a fixed codebook, and only the index, a sign
@@ -26,7 +26,7 @@ from gguf.quants import IQ1_S, IQ2_S, IQ2_XS, IQ2_XXS, IQ3_S, IQ3_XXS, IQ4_NL, M
 
 OUT_DEFAULT = (
     Path(__file__).resolve().parent.parent
-    / "src/LlmShield.Shieldstral/Quantization/QuantGrids.g.cs"
+    / "src/Jevstral/Quantization/QuantGrids.g.cs"
 )
 
 
@@ -85,7 +85,7 @@ def main() -> int:
 // Each grid entry is one signed byte. A grid of shape (N, K) is stored row-major:
 // entry i occupies [i*K, i*K + K).
 // </auto-generated>
-namespace LlmShield.Shieldstral.Quantization;
+namespace Jevstral.Quantization;
 
 internal static class QuantGrids
 {{

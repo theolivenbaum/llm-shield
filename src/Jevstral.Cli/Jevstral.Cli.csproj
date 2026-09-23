@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>Jevstral.Cli</RootNamespace>
+    <AssemblyName>jev</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../Jevstral/Jevstral.csproj" />
+  </ItemGroup>
+
+</Project>

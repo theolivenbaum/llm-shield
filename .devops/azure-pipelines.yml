@@ -1,6 +1,6 @@
 variables:
-  projectShieldstral: './src/LlmShield.Shieldstral/LlmShield.Shieldstral.csproj'
-  solution:           './LlmShield.slnx'
+  projectJevstral: './src/Jevstral/Jevstral.csproj'
+  solution:           './Jevstral.slnx'
   buildConfiguration: 'Release'
   targetVersion: yy.M.$(build.buildId)
 
@@ -42,7 +42,7 @@ steps:
     projects: '$(solution)'
 
 # The tests need no weights: the model-backed ones skip themselves when
-# SHIELDSTRAL_MODEL is unset, so this stays a couple of seconds and still covers
+# JEVSTRAL_MODEL is unset, so this stays a couple of seconds and still covers
 # the quantization, tokenizer and kernel oracles that a wrong package would break.
 - task: DotNetCoreCLI@2
   displayName: 'run tests'
@@ -52,10 +52,10 @@ steps:
     arguments: '-c $(buildConfiguration)'
 
 - task: DotNetCoreCLI@2
-  displayName: 'build Shieldstral project'
+  displayName: 'build Jevstral project'
   inputs:
     command: 'build'
-    projects: '$(projectShieldstral)'
+    projects: '$(projectJevstral)'
     arguments: '-c $(buildConfiguration) /p:Version=$(targetVersion)  /p:GeneratePackageOnBuild=true'
 
 - task: NuGetCommand@2
