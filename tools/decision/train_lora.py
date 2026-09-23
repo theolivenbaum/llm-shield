@@ -146,6 +146,7 @@ def main():
     ap.add_argument("--threads", type=int, default=4)
     ap.add_argument("--log-every", type=int, default=20)
     ap.add_argument("--save-every", type=int, default=200)
+    ap.add_argument("--resume", help="adapter to continue from; the schedule resumes at its saved step")
     a = ap.parse_args()
 
     torch.manual_seed(a.seed)
@@ -161,6 +162,14 @@ def main():
     train = load_sources(a.data, a.seed)
     val = load_sources(a.val, a.seed + 1) if a.val else []
     print(f"train {len(train)} decisions, val {len(val)}", flush=True)
+
+    start_step = 0
+    if a.resume:
+        from lora_io import load_lora
+        state, _ = load_lora(a.resume)
+        m.load_state_dict(state, strict=False)
+        start_step = int(torch.load(a.resume, weights_only=False)["extra"].get("step", 0))
+        print(f"resumed {a.resume} at step {start_step} (optimizer state starts fresh)", flush=True)
 
     params = m.lora_parameters()
     print(f"LoRA parameters: {sum(p.numel() for p in params) / 1e6:.2f}M on layers {a.layers_from}-25", flush=True)
@@ -179,10 +188,23 @@ def main():
         random.shuffle(idx)
         order += idx
     order = order[:total]
+    if start_step:
+        random.Random(a.seed + start_step).shuffle(order)
+        order = order[:total - start_step * a.accum]
+        for _ in range(start_step):
+            sched.step()
+
+    # The weights are file-backed pages of the safetensors mapping. When the allocator's
+    # arenas fragment under autograd, the kernel evicts those pages and re-reads them from
+    # disk, and a run slowed from 5 s to 15 s per decision that way. Trimming after every
+    # update gives the memory back.
+    import ctypes
+    import gc
+    libc = ctypes.CDLL("libc.so.6")
 
     t0 = time.time()
     run_loss, run_acc, n_run = 0.0, 0, 0
-    step = 0
+    step = start_step
     for i, j in enumerate(order):
         item = train[j]
         z, kind, _ = d.margins(item["question"], item["labels"], item["state"], grad_from=a.layers_from)
@@ -196,12 +218,16 @@ def main():
             opt.step()
             sched.step()
             opt.zero_grad(set_to_none=True)
+            gc.collect()
+            libc.malloc_trim(0)
             step += 1
             if step % a.log_every == 0:
                 el = time.time() - t0
+                done = i + 1
+                left = (n_updates - step) * a.accum
                 print(f"step {step}/{n_updates} loss {run_loss / n_run:.4f} acc {run_acc / n_run:.3f} "
-                      f"lr {sched.get_last_lr()[0]:.2e} {el / (i + 1):.2f}s/decision "
-                      f"eta {(total - i - 1) * el / (i + 1) / 60:.0f}min", flush=True)
+                      f"lr {sched.get_last_lr()[0]:.2e} {el / done:.2f}s/decision "
+                      f"eta {left * el / done / 60:.0f}min", flush=True)
                 run_loss, run_acc, n_run = 0.0, 0, 0
             if step % a.save_every == 0:
                 save_lora(a.out, m.lora_state(), lora, {"step": step, "args": vars(a)})
