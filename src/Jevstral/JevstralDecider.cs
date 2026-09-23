@@ -15,6 +15,22 @@ public enum DecisionType
     Score,
 }
 
+/// <summary>Where the state sits relative to each option's query.</summary>
+public enum DecisionLayout
+{
+    /// <summary>
+    /// Instruct, Document, Query. The document is read once, in the shared trunk, and every
+    /// option adds only its query. One document's worth of compute per decision.
+    /// </summary>
+    SharedDocument,
+    /// <summary>
+    /// Instruct, Query, Document: the model card's order. Every option re-reads the document
+    /// with that option already in view, which is stronger (standard tier 0.875 vs 0.819 with
+    /// the v1 adapter) but costs one document per option.
+    /// </summary>
+    PerOption,
+}
+
 /// <summary>One answer a decision can take, with the criterion that makes it correct.</summary>
 public sealed record DecisionOption(string Label, string Description = "");
 
@@ -100,12 +116,17 @@ public sealed class JevstralDecider : IDisposable
     private readonly int[] _verdictRows;
     private readonly IReadOnlyDictionary<string, float> _temperature;
     private SystemPromptCache? _system;
+    private readonly DecisionLayout _layout;
+
+    /// <summary>The prompt layout this instance renders; an adapter is only valid for the one it was trained on.</summary>
+    public DecisionLayout Layout => _layout;
 
     public MinistralModel Model => _model;
 
     private JevstralDecider(MinistralModel model, bool ownsModel, ParallelOptions options,
-        IReadOnlyDictionary<string, float>? temperature)
+        IReadOnlyDictionary<string, float>? temperature, DecisionLayout layout)
     {
+        _layout = layout;
         _model = model;
         _ownsModel = ownsModel;
         _options = options;
@@ -127,10 +148,11 @@ public sealed class JevstralDecider : IDisposable
     /// keys them. The bucket key wins. A missing key means 1.
     /// </param>
     public static async ValueTask<JevstralDecider> OpenAsync(
-        string ggufPath, IReadOnlyDictionary<string, float>? temperature = null, ParallelOptions? options = null)
+        string ggufPath, IReadOnlyDictionary<string, float>? temperature = null, ParallelOptions? options = null,
+        DecisionLayout layout = DecisionLayout.SharedDocument)
     {
         var decider = new JevstralDecider(new MinistralModel(ggufPath, initialCacheCapacity: 2048),
-            ownsModel: true, options ?? new ParallelOptions(), temperature);
+            ownsModel: true, options ?? new ParallelOptions(), temperature, layout);
         try
         {
             int[] system = [.. decider._model.Tokenizer.Encode(SystemBlock, addSpecial: true)];
@@ -148,8 +170,12 @@ public sealed class JevstralDecider : IDisposable
     private static string SystemBlock
         => ChatTemplate.SystemOpen + VerdictScorer.SystemPrompt + ChatTemplate.SystemClose;
 
-    /// <summary>The shared prefix: system prompt, instruction, option list, document.</summary>
-    public static string RenderPrefix(DecisionQuestion question, string state)
+    /// <summary>
+    /// The shared trunk: system prompt, instruction and option list, and for
+    /// <see cref="DecisionLayout.SharedDocument"/> the document too.
+    /// </summary>
+    public static string RenderPrefix(DecisionQuestion question, string state,
+        DecisionLayout layout = DecisionLayout.SharedDocument)
     {
         var sb = new StringBuilder(state.Length + 512);
         sb.Append(SystemBlock).Append(ChatTemplate.InstructionOpen).Append("<Instruct>: ").Append(Preamble)
@@ -161,16 +187,20 @@ public sealed class JevstralDecider : IDisposable
             sb.Append("\n- ").Append(noun).Append(' ').Append(o.Label);
             if (o.Description.Length > 0) sb.Append(": ").Append(o.Description);
         }
-        sb.Append("\n\n<Document>: ").Append(state);
+        if (layout == DecisionLayout.SharedDocument) sb.Append("\n\n<Document>: ").Append(state);
         return sb.ToString();
     }
 
-    /// <summary>The per-option query, which closes the instruction turn.</summary>
-    public static string RenderSuffix(DecisionQuestion question, DecisionOption option)
+    /// <summary>One option's branch: its query, then for <see cref="DecisionLayout.PerOption"/> the document, closing the turn.</summary>
+    public static string RenderSuffix(DecisionQuestion question, DecisionOption option,
+        DecisionLayout layout = DecisionLayout.SharedDocument, string? state = null)
     {
         string noun = question.Type == DecisionType.Score ? "level" : "option";
         string d = option.Description.Length > 0 ? $" ({option.Description})" : "";
-        return $"\n\n<Query>: Is {noun} {option.Label}{d} the correct answer to the question?{ChatTemplate.InstructionClose}";
+        string query = $"\n\n<Query>: Is {noun} {option.Label}{d} the correct answer to the question?";
+        return layout == DecisionLayout.PerOption
+            ? $"{query}\n\n<Document>: {state}{ChatTemplate.InstructionClose}"
+            : $"{query}{ChatTemplate.InstructionClose}";
     }
 
     public async ValueTask<DecisionResult> DecideAsync(DecisionQuestion question, string state, ParallelOptions? options = null)
@@ -180,7 +210,7 @@ public sealed class JevstralDecider : IDisposable
             throw new ArgumentException("A decision needs at least two options.", nameof(question));
         ParallelOptions po = options ?? _options;
 
-        int[] prefix = [.. _model.Tokenizer.Encode(RenderPrefix(question, state), addSpecial: true)];
+        int[] prefix = [.. _model.Tokenizer.Encode(RenderPrefix(question, state, _layout), addSpecial: true)];
         int start = 0;
         if (_system is not null && _system.IsPrefixOf(prefix))
         {
@@ -198,7 +228,7 @@ public sealed class JevstralDecider : IDisposable
         int suffixTokens = 0;
         for (int i = 0; i < branches.Length; i++)
         {
-            branches[i] = [.. _model.Tokenizer.Encode(RenderSuffix(question, question.Options[i]), addSpecial: false)];
+            branches[i] = [.. _model.Tokenizer.Encode(RenderSuffix(question, question.Options[i], _layout, state), addSpecial: false)];
             suffixTokens += branches[i].Length;
         }
         float[][] verdicts = await _model.ForwardTreeAsync(prefix.AsMemory(start), branches, _verdictRows, po)

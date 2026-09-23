@@ -21,6 +21,7 @@ internal static class Decide
         string? tasks = null, output = null, temps = null;
         int limit = 0, threads = -1;
         bool serve = false;
+        var layout = DecisionLayout.SharedDocument;
         for (int i = 1; i < args.Length; i++)
         {
             switch (args[i])
@@ -31,6 +32,14 @@ internal static class Decide
                 case "--limit": limit = int.Parse(args[++i], CultureInfo.InvariantCulture); break;
                 case "--threads": threads = int.Parse(args[++i], CultureInfo.InvariantCulture); break;
                 case "--serve": serve = true; break;
+                case "--layout":
+                    layout = args[++i] switch
+                    {
+                        "shared" or "docfirst" => DecisionLayout.SharedDocument,
+                        "per-option" or "card" => DecisionLayout.PerOption,
+                        var other => throw new ArgumentException($"unknown layout '{other}': expected shared or per-option"),
+                    };
+                    break;
                 default: Console.Error.WriteLine($"error: unexpected argument '{args[i]}'"); return 2;
             }
         }
@@ -40,7 +49,7 @@ internal static class Decide
             : JsonSerializer.Deserialize<Dictionary<string, float>>(File.ReadAllText(temps));
         var options = new ParallelOptions { MaxDegreeOfParallelism = threads };
         var sw = Stopwatch.StartNew();
-        using var decider = await JevstralDecider.OpenAsync(model, temperature, options).ConfigureAwait(false);
+        using var decider = await JevstralDecider.OpenAsync(model, temperature, options, layout).ConfigureAwait(false);
         Console.Error.WriteLine($"loaded in {sw.Elapsed.TotalSeconds:F1}s");
 
         using TextWriter writer = output is null ? Console.Out : new StreamWriter(output, append: false);

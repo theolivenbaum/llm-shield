@@ -38,7 +38,9 @@ class JevstralAdapter:
     cost_basis = "local_cpu_no_provider_tariff"
 
     def __init__(self, endpoint=None, model=None, key_env="", timeout_s=None, price_input_per_m=None,
-                 price_output_per_m=None, backend="csharp", temps=None, lora=None, threads=4, revision=None):
+                 price_output_per_m=None, backend="csharp", temps=None, lora=None, threads=4, revision=None,
+                 layout="docfirst"):
+        self.layout = layout
         self.path = endpoint
         self.model = model or "mistralai/Shieldstral-1.0-3B"
         self.backend = backend
@@ -59,6 +61,7 @@ class JevstralAdapter:
             cmd = ["dotnet", str(CLI), "decide", self.path, "--serve", "--threads", str(self.threads)]
             if self.temps:
                 cmd += ["--temps", self.temps]
+            cmd += ["--layout", "per-option" if self.layout == "card" else "shared"]
             self._proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                           stderr=subprocess.DEVNULL, text=True, bufsize=1)
         elif self.backend == "torch" and self._decider is None:
@@ -73,7 +76,7 @@ class JevstralAdapter:
             if state:
                 m.load_state_dict(state, strict=False)
             temps = json.loads(Path(self.temps).read_text()) if self.temps else None
-            self._decider = Decider(m, temperature=temps)
+            self._decider = Decider(m, temperature=temps, layout=self.layout)
 
     def _decide(self, task):
         if self.backend == "csharp":
@@ -110,7 +113,7 @@ class JevstralAdapter:
         res.ok = True
         res.usage = {"input_tokens": tokens, "output_tokens": 0} if tokens else {}
         res.raw = {"margins": margins, "runtime": {"backend": self.backend, "threads": self.threads,
-                                                   "lora": self.lora, "temps": self.temps,
+                                                   "lora": self.lora, "temps": self.temps, "layout": self.layout,
                                                    "probability_origin": "native-softmax-over-verdict-log-odds"}}
         return res
 
@@ -130,6 +133,7 @@ def main():
     ap.add_argument("--lora")
     ap.add_argument("--threads", type=int, default=4)
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--layout", default="docfirst", choices=["docfirst", "card"])
     a = ap.parse_args()
 
     run = Path(a.run_dir).expanduser().resolve()
@@ -140,7 +144,7 @@ def main():
     if a.limit:
         tasks = tasks[:a.limit]
     adapter = JevstralAdapter(endpoint=a.model, backend=a.backend, temps=a.temps, lora=a.lora,
-                                 threads=a.threads, price_input_per_m=0, price_output_per_m=0)
+                                 threads=a.threads, price_input_per_m=0, price_output_per_m=0, layout=a.layout)
     ledger = Ledger(str(run / "ledger.jsonl"))
     runner = Runner(adapter, ledger, run / "raw", default_reserve_usd=0.0)
     records = runner.run_all(tasks, results_path=run / "results.jsonl")

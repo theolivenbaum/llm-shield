@@ -39,6 +39,19 @@ public class DeciderTests
     }
 
     [Fact]
+    public void PerOptionLayoutPutsTheDocumentInEachBranch()
+    {
+        const string state = "Policy: refunds need a receipt. No receipt.";
+        string prefix = JevstralDecider.RenderPrefix(Refund, state, DecisionLayout.PerOption);
+        Assert.DoesNotContain("<Document>", prefix);
+        Assert.EndsWith("\n- option yes: Every required condition is established.", prefix);
+        Assert.Equal(
+            "\n\n<Query>: Is option no (A condition is missing or a prohibition applies.) the correct answer to the question?" +
+            "\n\n<Document>: " + state + "[/INST]",
+            JevstralDecider.RenderSuffix(Refund, Refund.Options[0], DecisionLayout.PerOption, state));
+    }
+
+    [Fact]
     public async Task BranchesMatchRunningEachContinuationAlone()
     {
         if (Fixtures.ModelPath is not { } path) { _output.WriteLine("JEVSTRAL_MODEL is not set; skipping"); return; }

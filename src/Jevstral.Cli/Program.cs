@@ -66,7 +66,8 @@ internal static class Program
         jev — Jevstral: typed decisions (noul / choice / score) on a CPU
 
           decide   <model.gguf> --tasks FILE.jsonl | --serve [--out FILE.jsonl] [--temps FILE.json]
-                   [--limit N] [--threads N]         typed decisions, JevBench-format JSONL
+                   [--layout shared|per-option] [--limit N] [--threads N]
+                                                         typed decisions, JevBench-format JSONL
           download [q5_1|q5_0|q4_0] [--to PATH]          fetch the base checkpoint (resumable)
           verdict  <model.gguf> --instruct TEXT --query TEXT --document TEXT [--json]
                                 [--document-file PATH] [--no-prefix-cache] [--prefix-cache PATH]
