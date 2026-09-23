@@ -122,6 +122,22 @@ public sealed class JevstralDecider : IDisposable
 
     /// <summary>The trunk tokens whose keys and values occupy the cache's leading slots.</summary>
     private int[] _resident = [];
+
+    /// <summary>
+    /// Question prefixes seen recently, most recent last. The resident trunk covers a run of calls
+    /// with one question; these cover several questions interleaved. Each is its prompt's leading
+    /// tokens (system, instruction, options) with their keys and values, about 0.2 MB per token.
+    /// </summary>
+    private readonly List<QuestionSnapshot> _questions = [];
+    private int _questionHits;
+
+    private sealed record QuestionSnapshot(int[] Tokens, float[] State);
+
+    /// <summary>How many question prefixes to keep. 0 turns the snapshots off; the resident trunk still works.</summary>
+    public int QuestionCacheSize { get; set; } = 8;
+
+    /// <summary>Calls whose question prefix came from a snapshot rather than the resident trunk.</summary>
+    public int QuestionCacheHits => _questionHits;
     private readonly DecisionLayout _layout;
 
     /// <summary>The prompt layout this instance renders; an adapter is only valid for the one it was trained on.</summary>
@@ -224,7 +240,20 @@ public sealed class JevstralDecider : IDisposable
         // option list) are reused as they are: truncate to the common prefix and run only the rest.
         // Every kernel is batch-invariant, so this is bit-identical to running the trunk whole.
         int start = CommonPrefix(prefix, _resident);
-        if (start > 0 && start >= (_system?.TokenCount ?? 0))
+
+        // The question part of this prompt: what it shares with the same question over empty data.
+        int[] questionOnly = [.. _model.Tokenizer.Encode(RenderPrefix(question, "", _layout), addSpecial: true)];
+        int questionLength = CommonPrefix(prefix, questionOnly);
+        QuestionSnapshot? snapshot = start < questionLength ? FindSnapshot(prefix, start) : null;
+
+        if (snapshot is not null)
+        {
+            // A question asked before, but not the last one: restore its prefix (a memcpy).
+            _model.KvCache.Restore(snapshot.State, snapshot.Tokens.Length);
+            start = snapshot.Tokens.Length;
+            _questionHits++;
+        }
+        else if (start > 0 && start >= (_system?.TokenCount ?? 0))
         {
             _model.KvCache.Truncate(start);
         }
@@ -255,6 +284,7 @@ public sealed class JevstralDecider : IDisposable
             .ConfigureAwait(false);
         _model.KvCache.Truncate(prefix.Length);
         _resident = prefix;
+        Remember(prefix, questionLength);
 
         var margins = new float[branches.Length];
         for (int i = 0; i < margins.Length; i++)
@@ -278,6 +308,32 @@ public sealed class JevstralDecider : IDisposable
         if (_temperature.TryGetValue($"{type}:{bucket}", out float t) || _temperature.TryGetValue(type, out t))
             return MathF.Max(t, 1e-3f);
         return 1f;
+    }
+
+    private QuestionSnapshot? FindSnapshot(int[] prefix, int atLeast)
+    {
+        QuestionSnapshot? best = null;
+        foreach (QuestionSnapshot q in _questions)
+            if (q.Tokens.Length > atLeast && q.Tokens.Length <= prefix.Length
+                && CommonPrefix(prefix, q.Tokens) == q.Tokens.Length
+                && (best is null || q.Tokens.Length > best.Tokens.Length))
+                best = q;
+        if (best is not null)
+        {
+            _questions.Remove(best);
+            _questions.Add(best);
+        }
+        return best;
+    }
+
+    /// <summary>Snapshots this call's question prefix, unless it is already kept.</summary>
+    private void Remember(int[] prefix, int questionLength)
+    {
+        if (QuestionCacheSize <= 0 || questionLength <= (_system?.TokenCount ?? 0)) return;
+        foreach (QuestionSnapshot q in _questions)
+            if (q.Tokens.Length == questionLength && CommonPrefix(prefix, q.Tokens) == questionLength) return;
+        _questions.Add(new QuestionSnapshot(prefix[..questionLength], _model.KvCache.Snapshot(questionLength)));
+        while (_questions.Count > QuestionCacheSize) _questions.RemoveAt(0);
     }
 
     private static int CommonPrefix(int[] a, int[] b)

@@ -114,6 +114,29 @@ public class DeciderTests
         Assert.Equal(fresh.Margins, reused.Margins);
     }
 
+    /// <summary>Two questions interleaved: each comes back from its snapshot, bit-identical to a cold call.</summary>
+    [Fact]
+    public async Task InterleavedQuestionsAreRestoredFromTheirSnapshots()
+    {
+        if (Fixtures.ModelPath is not { } path) { _output.WriteLine("JEVSTRAL_MODEL is not set; skipping"); return; }
+        DecisionQuestion intent = DecisionQuestion.Choice("Which intent does the message express?",
+            new("refund", "Wants money back"), new("cancel", "Wants to end a subscription"), new("other", "Anything else"));
+        const string data = "Please stop my plan at the end of the month.";
+
+        using var warm = await JevstralDecider.OpenAsync(path);
+        await warm.DecideAsync(intent, "I was charged twice.");
+        await warm.DecideAsync(Refund, "Policy: refunds require a receipt. The customer has a receipt.");
+        DecisionResult restored = await warm.DecideAsync(intent, data);
+
+        using var cold = await JevstralDecider.OpenAsync(path);
+        DecisionResult fresh = await cold.DecideAsync(intent, data);
+
+        _output.WriteLine($"restored {restored.CachedTokens} of {restored.PrefixTokens}; snapshot hits {warm.QuestionCacheHits}");
+        Assert.Equal(1, warm.QuestionCacheHits);
+        Assert.True(restored.CachedTokens > fresh.CachedTokens);
+        Assert.Equal(fresh.Margins, restored.Margins);
+    }
+
     [Fact]
     public async Task ADecisionIsADistributionOverItsOptions()
     {
