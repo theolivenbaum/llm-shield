@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -262,6 +263,25 @@ def pick_type(name: str, requested: GGMLQuantizationType, shape: tuple[int, ...]
     return requested if shape[-1] % block == 0 else GGMLQuantizationType.F16
 
 
+class _ChunkedWrite(np.ndarray):
+    """
+    An ndarray whose ``tofile`` goes through the Python file object in 64 MiB chunks.
+
+    GGUFWriter writes each tensor with ``ndarray.tofile``: a single C ``fwrite`` that treats a
+    short write as fatal ("OSError: 30081024 requested and 20112184 written"). Some filesystems
+    return short writes for large buffers even with space to spare; WSL's ``/mnt/<drive>`` mounts
+    of Windows drives are the common case. ``BufferedWriter.write`` keeps writing until the whole
+    chunk is on disk, or raises a real error.
+    """
+
+    _CHUNK = 64 << 20
+
+    def tofile(self, fid, sep="", format="%s"):  # noqa: A002 - numpy's signature
+        view = memoryview(np.ascontiguousarray(self).view(np.uint8).reshape(-1))
+        for start in range(0, len(view), self._CHUNK):
+            fid.write(view[start:start + self._CHUNK])
+
+
 def add_tensor(writer: GGUFWriter, name: str, array: np.ndarray, qtype: GGMLQuantizationType) -> None:
     # The writer reverses the numpy shape on the way out, so a (out, in) weight
     # lands in the file as ne = [in, out] — one output feature per contiguous row,
@@ -269,13 +289,23 @@ def add_tensor(writer: GGUFWriter, name: str, array: np.ndarray, qtype: GGMLQuan
     # type it derives the logical shape from the byte shape itself, so hand it the
     # packed array and nothing else.
     data = quantize(array.astype(np.float32, copy=False), qtype)
-    writer.add_tensor(name, data, raw_dtype=qtype)
+    writer.add_tensor(name, data.view(_ChunkedWrite), raw_dtype=qtype)
 
 
 # ----------------------------------------------------------------- conversion
 
 def convert_text_model(src: Path, out: Path, params: dict, tekken: dict,
                        qtype: GGMLQuantizationType, chat_template: str | None) -> None:
+    # Written beside the destination and renamed only once complete: the runtime treats a GGUF
+    # that exists as one worth memory-mapping, so an interrupted conversion must not leave a
+    # truncated file under the final name.
+    partial = Path(str(out) + ".partial")
+    _convert_text_model(src, partial, params, tekken, qtype, chat_template)
+    os.replace(partial, out)
+
+
+def _convert_text_model(src: Path, out: Path, params: dict, tekken: dict,
+                        qtype: GGMLQuantizationType, chat_template: str | None) -> None:
     writer = GGUFWriter(str(out), ARCH)
 
     n_layers = params["n_layers"]
