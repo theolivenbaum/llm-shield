@@ -40,6 +40,8 @@ def main():
     ap.add_argument("--lora")
     ap.add_argument("--report")
     ap.add_argument("--threads", type=int, default=4)
+    ap.add_argument("--layout", default="docfirst")
+    ap.add_argument("--query", default="short")
     a = ap.parse_args()
     if a.report:
         summarize(a.report)
@@ -56,8 +58,9 @@ def main():
     m = Shieldstral(a.model_dir, lora=cfg).eval()
     if state:
         m.load_state_dict(state, strict=False)
-    d = Decider(m)
-    items = load_sources([f"td:{a.data}"], seed=123)
+    d = Decider(m, layout=a.layout, query=a.query)
+    spec = a.data if a.data.startswith(("td:", "syn:")) else f"td:{a.data}"
+    items = load_sources([spec], seed=123)
     done = {json.loads(l)["id"] for l in open(a.out)} if os.path.exists(a.out) else set()
     with open(a.out, "a") as f, torch.no_grad():
         for i, it in enumerate(items):
