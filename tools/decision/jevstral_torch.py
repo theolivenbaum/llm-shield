@@ -38,6 +38,8 @@ SYSTEM_BLOCK = f"[SYSTEM_PROMPT]{SYSTEM_PROMPT}[/SYSTEM_PROMPT]"
 LORA_TARGETS = ("wq", "wk", "wv", "wo", "w1", "w2", "w3")
 
 
+
+
 class LoRALinear(nn.Module):
     """y = x W^T + (alpha/r) * (x A^T) B^T. W is frozen, and B starts at zero, so step 0 is the base model."""
 
@@ -211,9 +213,18 @@ class Shieldstral(nn.Module):
         ny = len(self.yes_ids)
         return z[:, :ny].max(-1).values - z[:, ny:].max(-1).values
 
-    def full_logits(self, h_last: torch.Tensor) -> torch.Tensor:
-        n = rmsnorm(h_last, self.norm, self.eps).float()
-        return n @ self.embed.float().T
+    def full_logits(self, h_last: torch.Tensor, fast: bool = False) -> torch.Tensor:
+        """
+        Full-vocabulary logits. The exact path widens the bf16 embedding table to fp32, a 1.6 GB
+        conversion that cost ~1.7 s per call: fine for scoring a handful of label tokens, ruinous once
+        per decode step. fast=True multiplies in bf16 and widens only the output (0.06 s). Its
+        rounding (~0.1 on logits in the 20s) is harmless for choosing the next greedy token, and it
+        is never used to score labels.
+        """
+        n = rmsnorm(h_last, self.norm, self.eps)
+        if fast:
+            return F.linear(n.to(torch.bfloat16), self.embed).float()
+        return n.float() @ self.embed.float().T
 
     def encode(self, text: str, bos: bool = False) -> list[int]:
         return self.tok.encode(text, add_bos=bos)
