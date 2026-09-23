@@ -179,6 +179,8 @@ def main():
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--threads", type=int, default=4)
     ap.add_argument("--ids", help="comma-separated task ids to run")
+    ap.add_argument("--continue-from", help="JSONL from an earlier run: rows that did not close [/THINK] "
+                    "resume from their saved tokens with --max-think more")
     ap.add_argument("--syn", help="gen_synthetic.py JSONL instead of JevBench (for calibration fits)")
     a = ap.parse_args()
 
@@ -208,6 +210,13 @@ def main():
         tasks = [x for x in tasks if x[1].id in want]
     if a.limit:
         tasks = tasks[:a.limit]
+    resume = {}
+    if a.continue_from:
+        for line in open(a.continue_from):
+            r = json.loads(line)
+            if not r.get("closed") and r.get("gen_ids"):
+                resume[r["id"]] = r["gen_ids"]
+        tasks = [x for x in tasks if x[1].id in resume]
     done = {json.loads(l)["id"] for l in open(a.out)} if os.path.exists(a.out) else set()
     tasks = [x for x in tasks if x[1].id not in done]
     # Similar lengths batch together, so padding stays small.
@@ -216,7 +225,8 @@ def main():
     with open(a.out, "a") as f:
         batches, cur = [], []
         for x in tasks:
-            n = len(m.encode(render(x[1].question, x[1].labels, x[1].state, system), bos=True)) + a.max_think
+            n = (len(m.encode(render(x[1].question, x[1].labels, x[1].state, system), bos=True)) + a.max_think
+                 + len(resume.get(x[1].id, [])))
             if cur and (len(cur) >= a.batch or (len(cur) + 1) * max(n, cur_max) > a.kv_tokens):
                 batches.append(cur)
                 cur = []
@@ -230,10 +240,15 @@ def main():
             for tier, t in chunk:
                 labels = ["no", "yes"] if t.question["type"] == "noul" else t.labels
                 labs.append(labels)
-                prompts.append(m.encode(render(t.question, labels, t.state, system) + "[THINK]", bos=True))
+                prompts.append(m.encode(render(t.question, labels, t.state, system) + "[THINK]", bos=True)
+                               + [x for x in resume.get(t.id, []) if x != end_think])
             gens = reason_batch(m, prompts, a.max_think, end_think, eos, None)
             gen_s = time.time() - t0
             for (tier, t), labels, p, g in zip(chunk, labs, prompts, gens):
+                prior = [x for x in resume.get(t.id, []) if x != end_think]
+                if prior:
+                    p = p[:len(p) - len(prior)]
+                    g = prior + g
                 g = [x for x in g if x != eos]
                 if end_think not in g:
                     g = g + [end_think]
@@ -253,7 +268,7 @@ def main():
                 rec = {"id": t.id, "tier": tier, "family": t.family, "qtype": t.question["type"], "labels": labels,
                        "mode": "reason", "probs": tp, "margins": sc, "expected": t.expected,
                        "correct": res["correct"], **({"target": t.target} if a.syn else {}), "think_tokens": think_end, "closed": end_think in gens[chunk.index((tier, t))],
-                       "answer_text": text_of(m, g[think_end:])[-200:], "reasoning": text_of(m, g[:think_end])[-3000:],
+                       "reasoning": text_of(m, g[:think_end]), "gen_ids": g[:think_end],
                        "latency_s": gen_s / len(chunk)}
                 f.write(json.dumps(rec) + "\n")
                 f.flush()
