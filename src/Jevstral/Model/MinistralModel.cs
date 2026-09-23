@@ -166,7 +166,7 @@ public sealed class MinistralModel : IDisposable
         ReadOnlyMemory<int> tokens, int[] vocabRows, ParallelOptions options)
     {
         var result = new float[1][];
-        await ForwardAsync(tokens, null, options, computeLogits: false, branchOffsets: null,
+        await ForwardAsync(tokens, null, options, computeLogits: false, layout: null,
             selectedRows: vocabRows, selectedOut: result).ConfigureAwait(false);
         return result[0];
     }
@@ -213,7 +213,83 @@ public sealed class MinistralModel : IDisposable
         for (int b = 0; b < branches.Count; b++) branches[b].CopyTo(tokens, offsets[b]);
 
         var result = new float[branches.Count][];
-        await ForwardAsync(tokens, null, options, computeLogits: false, offsets, vocabRows, result).ConfigureAwait(false);
+        TokenLayout layout = TokenLayout.Tree(KvCache.Length, trunk.Length, offsets, total);
+        await ForwardAsync(tokens, null, options, computeLogits: false, layout, vocabRows, result).ConfigureAwait(false);
+        return result;
+    }
+
+    /// <summary>
+    /// A tree pass that returns full-vocabulary logits at every token of every branch:
+    /// <c>result[b][i]</c> predicts the token after branch b's i-th token. That is what scoring
+    /// whole continuations needs (a label's log-probability, token by token), which the
+    /// verdict's two rows cannot give.
+    /// </summary>
+    public async ValueTask<float[][][]> ForwardTreeLogitsAsync(
+        ReadOnlyMemory<int> trunk, IReadOnlyList<int[]> branches, ParallelOptions options)
+    {
+        ArgumentNullException.ThrowIfNull(branches);
+        var offsets = new int[branches.Count];
+        int total = trunk.Length;
+        for (int b = 0; b < branches.Count; b++)
+        {
+            if (branches[b].Length == 0) throw new ArgumentException($"Branch {b} is empty.", nameof(branches));
+            offsets[b] = total;
+            total += branches[b].Length;
+        }
+        var tokens = new int[total];
+        trunk.Span.CopyTo(tokens);
+        for (int b = 0; b < branches.Count; b++) branches[b].CopyTo(tokens, offsets[b]);
+
+        TokenLayout tree = TokenLayout.Tree(KvCache.Length, trunk.Length, offsets, total);
+        int[] outputs = [.. Enumerable.Range(trunk.Length, total - trunk.Length)];
+        var flat = new float[outputs.Length][];
+        await ForwardAsync(tokens, null, options, computeLogits: false, tree.WithOutputs(outputs), null, flat).ConfigureAwait(false);
+
+        var result = new float[branches.Count][][];
+        for (int b = 0, k = 0; b < branches.Count; b++)
+        {
+            result[b] = new float[branches[b].Length][];
+            for (int i = 0; i < branches[b].Length; i++) result[b][i] = flat[k++];
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Appends tokens to several independent sequences ("rows") in one pass, and returns each
+    /// row's logits at its last new token: <paramref name="vocabRows"/> only, or the full
+    /// vocabulary when null. The rows share the <paramref name="shared"/> cache slots before them
+    /// (a common system prompt). Row r owns slots from <paramref name="rowBase"/>[r] and already
+    /// holds <paramref name="rowLength"/>[r] tokens; the caller advances the lengths. Prefilling
+    /// many prompts is one GEMM. A decode step (one token per row) is one GEMM over the weights
+    /// for all rows, which is what makes batched generation cheaper than one row at a time: the
+    /// weights are decoded once per step, not once per row.
+    /// </summary>
+    /// <summary>
+    /// Appends <paramref name="tokens"/> to one row and returns full-vocabulary logits at every one
+    /// of them (<c>result[i]</c> predicts the token after <c>tokens[i]</c>). This is what scoring a
+    /// multi-token continuation needs.
+    /// </summary>
+    public async ValueTask<float[][]> ForwardRowTokensAsync(
+        int shared, int rowBase, int rowLength, int[] tokens, ParallelOptions options)
+    {
+        TokenLayout rows = TokenLayout.Rows(shared, [rowBase], [rowLength], [tokens.Length], sparse: tokens.Length < 16);
+        var result = new float[tokens.Length][];
+        await ForwardAsync(tokens, null, options, computeLogits: false,
+            rows.WithOutputs([.. Enumerable.Range(0, tokens.Length)]), null, result).ConfigureAwait(false);
+        return result;
+    }
+
+    public async ValueTask<float[][]> ForwardRowsAsync(
+        int shared, int[] rowBase, int[] rowLength, IReadOnlyList<int[]> rowTokens, int[]? vocabRows,
+        ParallelOptions options)
+    {
+        int[] counts = [.. rowTokens.Select(r => r.Length)];
+        if (counts.Any(c => c == 0)) throw new ArgumentException("Every row needs at least one token.", nameof(rowTokens));
+        var tokens = new int[counts.Sum()];
+        for (int r = 0, o = 0; r < rowTokens.Count; o += counts[r], r++) rowTokens[r].CopyTo(tokens, o);
+        TokenLayout layout = TokenLayout.Rows(shared, rowBase, rowLength, counts, sparse: counts.Max() < 16);
+        var result = new float[rowTokens.Count][];
+        await ForwardAsync(tokens, null, options, computeLogits: false, layout, vocabRows, result).ConfigureAwait(false);
         return result;
     }
 
@@ -221,20 +297,21 @@ public sealed class MinistralModel : IDisposable
         ReadOnlyMemory<int> tokens, IActivationSink? capture, ParallelOptions options, bool computeLogits)
         => ForwardAsync(tokens, capture, options, computeLogits, null, null, null);
 
+    /// <param name="selectedRows">With <paramref name="selectedOut"/>: logits of just these vocabulary rows per output; null for the full vocabulary.</param>
     private async ValueTask<ReadOnlyMemory<float>> ForwardAsync(
         ReadOnlyMemory<int> tokens, IActivationSink? capture, ParallelOptions options, bool computeLogits,
-        int[]? branchOffsets, int[]? selectedRows, float[][]? selectedOut)
+        TokenLayout? layout, int[]? selectedRows, float[][]? selectedOut)
     {
         ArgumentNullException.ThrowIfNull(options);
         if (tokens.Length == 0) throw new ArgumentException("No tokens to forward.", nameof(tokens));
 
         int seq = tokens.Length;
         int startPos = KvCache.Length;
-        Branches? layout = branchOffsets is null ? null : new Branches(branchOffsets, seq, startPos);
         int hidden = Config.HiddenSize;
         int ff = Config.FeedForwardSize;
 
-        KvCache.EnsureCapacity(startPos + seq);
+        int end = layout?.End ?? startPos + seq;
+        KvCache.EnsureCapacity(end);
 
         float[] states = ArrayPool<float>.Shared.Rent(seq * hidden);
         float[] normed = ArrayPool<float>.Shared.Rent(seq * hidden);
@@ -280,9 +357,33 @@ public sealed class MinistralModel : IDisposable
                 capture?.Observe($"blk.{l}.output", h.Span, seq, hidden);
             }
 
-            KvCache.Advance(seq);
+            KvCache.Advance(Math.Max(0, end - KvCache.Length));
 
-            if (selectedRows is not null && selectedOut is not null)
+            if (selectedOut is not null && selectedRows is null)
+            {
+                // Full vocabulary for every requested output, as one batched LM-head product.
+                int n = selectedOut.Length;
+                int[] outputs = layout?.Outputs ?? [seq - 1];
+                float[] rowsBuffer = ArrayPool<float>.Shared.Rent(n * hidden);
+                float[] logitsBuffer = ArrayPool<float>.Shared.Rent(n * Config.VocabSize);
+                try
+                {
+                    for (int b = 0; b < n; b++)
+                        Kernels.RmsNorm(h.Span.Slice(outputs[b] * hidden, hidden), _outputNorm, Config.RmsNormEps,
+                            rowsBuffer.AsSpan(b * hidden, hidden));
+                    WeightMatrix table = _lmHead.IsEmpty ? _tokenEmbeddings : _lmHead;
+                    await QuantMatMul.ForwardAsync(table, rowsBuffer.AsMemory(0, n * hidden), n,
+                        logitsBuffer.AsMemory(0, n * Config.VocabSize), options).ConfigureAwait(false);
+                    for (int b = 0; b < n; b++)
+                        selectedOut[b] = logitsBuffer.AsSpan(b * Config.VocabSize, Config.VocabSize).ToArray();
+                }
+                finally
+                {
+                    ArrayPool<float>.Shared.Return(rowsBuffer);
+                    ArrayPool<float>.Shared.Return(logitsBuffer);
+                }
+            }
+            else if (selectedRows is not null && selectedOut is not null)
             {
                 WeightMatrix table = _lmHead.IsEmpty ? _tokenEmbeddings : _lmHead;
                 float[] row = ArrayPool<float>.Shared.Rent(hidden);
@@ -291,7 +392,7 @@ public sealed class MinistralModel : IDisposable
                     Span<float> n = norm.Span[..hidden];
                     for (int b = 0; b < selectedOut.Length; b++)
                     {
-                        int lastToken = layout is null ? seq - 1 : layout.Value.LastToken(b);
+                        int lastToken = layout is null ? seq - 1 : layout.Outputs[b];
                         Kernels.RmsNorm(h.Span.Slice(lastToken * hidden, hidden), _outputNorm, Config.RmsNormEps, n);
                         var logits = new float[selectedRows.Length];
                         for (int i = 0; i < selectedRows.Length; i++)
@@ -344,13 +445,13 @@ public sealed class MinistralModel : IDisposable
     /// <param name="output">Receives the attention block's contribution, seq × hidden.</param>
     private async ValueTask AttentionAsync(
         Layer layer, int layerIndex, ReadOnlyMemory<float> input,
-        float[] queryBuffer, Memory<float> output, int seq, int startPos, Branches? layout,
+        float[] queryBuffer, Memory<float> output, int seq, int startPos, TokenLayout? layout,
         IActivationSink? capture, ParallelOptions options)
     {
         int heads = Config.HeadCount, kvHeads = Config.KvHeadCount, headDim = Config.HeadDim;
         int group = Config.GroupSize, kvDim = Config.KvDim, qDim = Config.QDim;
         float scale = 1f / MathF.Sqrt(headDim);
-        int cacheLength = startPos + seq;
+        int cacheLength = layout?.End ?? startPos + seq;
 
         Memory<float> q = queryBuffer.AsMemory(0, seq * qDim);
         await QuantMatMul.ForwardAsync(layer.Q, input, seq, q, options).ConfigureAwait(false);
@@ -369,7 +470,7 @@ public sealed class MinistralModel : IDisposable
             capture?.Observe($"blk.{layerIndex}.k_rope", kv.Span, seq, kvDim);
 
             await QuantMatMul.ForwardAsync(layer.V, input, seq, kv, options).ConfigureAwait(false);
-            StoreValues(kv.Span, layerIndex, kvHeads, headDim, kvDim, seq, startPos);
+            StoreValues(kv.Span, layerIndex, kvHeads, headDim, kvDim, seq, startPos, layout);
             capture?.Observe($"blk.{layerIndex}.v", kv.Span, seq, kvDim);
         }
         finally
@@ -392,7 +493,7 @@ public sealed class MinistralModel : IDisposable
             // pool is what makes that free: a per-head cache on the model would have
             // to be sized for the widest fan-out any caller ever asks for, and would
             // pin every one of those buffers for the model's lifetime.
-            if (headDim == AttentionKernels.HeadDim && AttentionKernels.Supported)
+            if (headDim == AttentionKernels.HeadDim && AttentionKernels.Supported && layout is not { Sparse: true })
             {
                 await Parallel.ForAsync(0, heads, options, (head, _) =>
                 {
@@ -414,9 +515,9 @@ public sealed class MinistralModel : IDisposable
                         // Visible keys: everything shared [0, shared), then this token's own
                         // segment up to itself. For a plain sequence both are startPos and the
                         // two ranges are simply the causal mask [0, startPos + t].
-                        int self = startPos + t;
-                        int shared = layout?.Shared(t) ?? startPos;
-                        int segment = layout?.SegmentStart(t) ?? startPos;
+                        int self = layout?.Slot[t] ?? startPos + t;
+                        int shared = layout?.Shared[t] ?? startPos;
+                        int segment = layout?.Segment[t] ?? startPos;
                         int limit = shared + (self - segment + 1);
                         ReadOnlySpan<float> query = q.Span.Slice(t * qDim + head * headDim, headDim);
                         Span<float> row = scores.AsSpan(0, limit);
@@ -461,7 +562,7 @@ public sealed class MinistralModel : IDisposable
     /// the same two ranges as the portable loop: [0, shared) and the token's own segment.
     /// </summary>
     private static unsafe void AttendHead(KvCache cache, int layer, int kvHead, int head, Memory<float> q,
-        Memory<float> context, int seq, int startPos, int cacheLength, int qDim, float scale, Branches? layout)
+        Memory<float> context, int seq, int startPos, int cacheLength, int qDim, float scale, TokenLayout? layout)
     {
         const int hd = AttentionKernels.HeadDim;
         int ldk = (cacheLength + 15) & ~15;
@@ -481,17 +582,19 @@ public sealed class MinistralModel : IDisposable
                 int t = 0;
                 while (t < seq)
                 {
-                    int shared = layout?.Shared(t) ?? startPos;
-                    int segment = layout?.SegmentStart(t) ?? startPos;
+                    int shared = layout?.Shared[t] ?? startPos;
+                    int segment = layout?.Segment[t] ?? startPos;
+                    int slot = layout?.Slot[t] ?? startPos + t;
 
                     // Up to four consecutive tokens of the same segment. They see the same
                     // shared range, and their own ranges are prefixes of the last one's.
                     int n = 1;
                     while (n < 4 && t + n < seq
-                           && (layout?.Shared(t + n) ?? startPos) == shared
-                           && (layout?.SegmentStart(t + n) ?? startPos) == segment) n++;
+                           && (layout?.Shared[t + n] ?? startPos) == shared
+                           && (layout?.Segment[t + n] ?? startPos) == segment
+                           && (layout?.Slot[t + n] ?? startPos + t + n) == slot + n) n++;
 
-                    int ownLast = startPos + t + n - 1 - segment + 1;
+                    int ownLast = slot + n - 1 - segment + 1;
                     float* r0 = rows, r1 = rows + cacheLength, r2 = rows + 2 * cacheLength, r3 = rows + 3 * cacheLength;
                     float* q0 = qs + (long)t * qDim + head * hd;
                     float* q1 = n > 1 ? q0 + qDim : q0;
@@ -532,35 +635,37 @@ public sealed class MinistralModel : IDisposable
         }
     }
 
-    private void RotateQueries(Span<float> q, int heads, int headDim, int qDim, int seq, int startPos, Branches? layout)
+    private void RotateQueries(Span<float> q, int heads, int headDim, int qDim, int seq, int startPos, TokenLayout? layout)
     {
         for (int t = 0; t < seq; t++)
         {
             Span<float> row = q.Slice(t * qDim, qDim);
-            int position = layout?.Position(t) ?? startPos + t;
+            int position = layout?.Position[t] ?? startPos + t;
             _rope.Apply(row, heads, headDim, position);
             ApplyPositionScale(row, position);
         }
     }
 
     private void StoreKeys(Span<float> kv, int layerIndex, int kvHeads, int headDim, int kvDim, int seq, int startPos,
-        Branches? layout)
+        TokenLayout? layout)
     {
         for (int t = 0; t < seq; t++)
         {
             Span<float> row = kv.Slice(t * kvDim, kvDim);
-            _rope.Apply(row, kvHeads, headDim, layout?.Position(t) ?? startPos + t);
+            _rope.Apply(row, kvHeads, headDim, layout?.Position[t] ?? startPos + t);
+            int slot = layout?.Slot[t] ?? startPos + t;
             for (int kh = 0; kh < kvHeads; kh++)
-                row.Slice(kh * headDim, headDim).CopyTo(KvCache.Key(layerIndex, kh, startPos + t));
+                row.Slice(kh * headDim, headDim).CopyTo(KvCache.Key(layerIndex, kh, slot));
         }
     }
 
-    private void StoreValues(Span<float> kv, int layerIndex, int kvHeads, int headDim, int kvDim, int seq, int startPos)
+    private void StoreValues(Span<float> kv, int layerIndex, int kvHeads, int headDim, int kvDim, int seq, int startPos,
+        TokenLayout? layout)
     {
         for (int t = 0; t < seq; t++)
             for (int kh = 0; kh < kvHeads; kh++)
                 kv.Slice(t * kvDim + kh * headDim, headDim)
-                    .CopyTo(KvCache.Value(layerIndex, kh, startPos + t));
+                    .CopyTo(KvCache.Value(layerIndex, kh, layout?.Slot[t] ?? startPos + t));
     }
 
     /// <summary>
@@ -587,29 +692,92 @@ public sealed class MinistralModel : IDisposable
 }
 
 /// <summary>
-/// Where each token of a branched forward sits. Tokens before the first offset are a
-/// causal trunk; each offset starts a branch that sees the cache, the whole trunk and its
-/// own earlier tokens. Token t is always written to cache slot startPos + t; what varies is
-/// its RoPE position and which slots it may attend to.
+/// Where each token of a forward pass sits in the KV cache and what it may attend to.
+///
+/// Token t is written to cache slot <see cref="Slot"/>[t] and rotated as position
+/// <see cref="Position"/>[t]. It attends to slots [0, <see cref="Shared"/>[t]) and to its own
+/// segment [<see cref="Segment"/>[t], slot]. A plain sequence has shared = segment = the cache
+/// length before the call, and the two ranges are the causal mask. A tree gives each branch the
+/// trunk as shared. Independent rows give each row its own region of the cache.
 /// </summary>
-internal readonly struct Branches(int[] offsets, int tokens, int startPos)
+internal sealed class TokenLayout
 {
-    private int Trunk => offsets[0];
+    public required int[] Slot { get; init; }
+    public required int[] Position { get; init; }
+    public required int[] Shared { get; init; }
+    public required int[] Segment { get; init; }
+    /// <summary>Tokens whose logits the caller wants, in output order.</summary>
+    public required int[] Outputs { get; init; }
+    /// <summary>
+    /// Few tokens per segment (a decode step): attention takes the per-key path, which touches
+    /// only visible keys. The transposed-key kernel would transpose every region every step.
+    /// </summary>
+    public bool Sparse { get; init; }
 
-    private int BranchOf(int t)
+    /// <summary>One past the highest slot written.</summary>
+    public int End { get; private init; }
+
+    public static TokenLayout Tree(int startPos, int trunk, int[] offsets, int tokens)
     {
-        int i = Array.BinarySearch(offsets, t);
-        return i >= 0 ? i : ~i - 1;
+        var slot = new int[tokens];
+        var pos = new int[tokens];
+        var shared = new int[tokens];
+        var seg = new int[tokens];
+        int branch = -1;
+        for (int t = 0; t < tokens; t++)
+        {
+            slot[t] = startPos + t;
+            while (branch + 1 < offsets.Length && t >= offsets[branch + 1]) branch++;
+            if (t < trunk || branch < 0)
+            {
+                pos[t] = startPos + t; shared[t] = startPos; seg[t] = startPos;
+            }
+            else
+            {
+                pos[t] = startPos + trunk + (t - offsets[branch]);
+                shared[t] = startPos + trunk;
+                seg[t] = startPos + offsets[branch];
+            }
+        }
+        var outputs = new int[offsets.Length];
+        for (int b = 0; b < offsets.Length; b++) outputs[b] = (b + 1 < offsets.Length ? offsets[b + 1] : tokens) - 1;
+        return new TokenLayout { Slot = slot, Position = pos, Shared = shared, Segment = seg, Outputs = outputs, End = startPos + tokens };
     }
 
-    public int Position(int t) => t < Trunk ? startPos + t : startPos + Trunk + (t - offsets[BranchOf(t)]);
+    /// <summary>Every token of the listed branches is an output (for scoring whole continuations).</summary>
+    public TokenLayout WithOutputs(int[] outputs) => new()
+    {
+        Slot = Slot, Position = Position, Shared = Shared, Segment = Segment, Outputs = outputs, Sparse = Sparse, End = End,
+    };
 
-    /// <summary>Slots [0, Shared) are visible in full: the cache for a trunk token, cache plus trunk for a branch token.</summary>
-    public int Shared(int t) => t < Trunk ? startPos : startPos + Trunk;
-
-    public int SegmentStart(int t) => t < Trunk ? startPos : startPos + offsets[BranchOf(t)];
-
-    public int LastToken(int branch) => (branch + 1 < offsets.Length ? offsets[branch + 1] : tokens) - 1;
+    /// <summary>
+    /// Independent rows after a shared prefix of <paramref name="shared"/> slots. Row r lives in
+    /// slots [rowBase[r], rowBase[r] + capacity); it already holds rowLength[r] tokens, and its
+    /// new tokens take the next slots, at positions shared + rowLength[r] + i.
+    /// </summary>
+    public static TokenLayout Rows(int shared, int[] rowBase, int[] rowLength, int[] rowTokens, bool sparse)
+    {
+        int total = rowTokens.Sum();
+        var slot = new int[total];
+        var pos = new int[total];
+        var sh = new int[total];
+        var seg = new int[total];
+        var outputs = new int[rowTokens.Length];
+        int t = 0, end = shared;
+        for (int r = 0; r < rowTokens.Length; r++)
+        {
+            for (int i = 0; i < rowTokens[r]; i++, t++)
+            {
+                slot[t] = rowBase[r] + rowLength[r] + i;
+                pos[t] = shared + rowLength[r] + i;
+                sh[t] = shared;
+                seg[t] = rowBase[r];
+                end = Math.Max(end, slot[t] + 1);
+            }
+            outputs[r] = t - 1;
+        }
+        return new TokenLayout { Slot = slot, Position = pos, Shared = sh, Segment = seg, Outputs = outputs, Sparse = sparse, End = end };
+    }
 }
 
 /// <summary>

@@ -43,7 +43,9 @@ def render(q, labels, state, system):
     qtype = q["type"]
     if qtype == "noul":
         c = q.get("criteria") or {}
-        opts = [("no", c.get("false", "the statement does not hold")), ("yes", c.get("true", "the statement holds"))]
+        # The same defaults as the C# DecisionQuestion.Noul, so the two render identical bytes.
+        opts = [("no", c.get("false") or "no, the statement does not hold"),
+                ("yes", c.get("true") or "yes, the statement holds")]
     else:
         opts = option_lines(qtype, labels, q.get("criteria"))
     body = "\n".join(f"- {lab}: {desc}" if desc else f"- {lab}" for lab, desc in opts)

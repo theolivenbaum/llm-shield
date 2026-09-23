@@ -96,6 +96,77 @@ internal static class Decide
         return 0;
     }
 
+    /// <summary>
+    /// `reason`: the reason-then-decide path over the same JSONL records. Items are batched, so
+    /// the whole file is read first and the lines are written as each batch completes.
+    /// </summary>
+    public static async Task<int> Reason(string[] args)
+    {
+        if (args.Length == 0) { Console.Error.WriteLine("error: reason needs a model path"); return 2; }
+        string model = args[0];
+        string? tasks = null, output = null, system = null;
+        int limit = 0, threads = -1, maxThink = 1536, rows = 12;
+        float temperature = 1f;
+        for (int i = 1; i < args.Length; i++)
+        {
+            switch (args[i])
+            {
+                case "--tasks": tasks = args[++i]; break;
+                case "--out": output = args[++i]; break;
+                case "--system": system = args[++i]; break;
+                case "--limit": limit = int.Parse(args[++i], CultureInfo.InvariantCulture); break;
+                case "--threads": threads = int.Parse(args[++i], CultureInfo.InvariantCulture); break;
+                case "--max-think": maxThink = int.Parse(args[++i], CultureInfo.InvariantCulture); break;
+                case "--rows": rows = int.Parse(args[++i], CultureInfo.InvariantCulture); break;
+                case "--temperature": temperature = float.Parse(args[++i], CultureInfo.InvariantCulture); break;
+                default: Console.Error.WriteLine($"error: unexpected argument '{args[i]}'"); return 2;
+            }
+        }
+        if (tasks is null || system is null) { Console.Error.WriteLine("error: --tasks and --system are required"); return 2; }
+
+        var records = File.ReadLines(tasks).Where(l => !string.IsNullOrWhiteSpace(l)).Select(l => JsonNode.Parse(l)!).ToList();
+        if (limit > 0) records = records.Take(limit).ToList();
+        var items = records.Select(Parse).ToList();
+
+        var options = new ParallelOptions { MaxDegreeOfParallelism = threads };
+        using var decider = ReasoningDecider.Open(model, File.ReadAllText(system), options);
+        decider.MaxThinkTokens = maxThink;
+        decider.MaxRows = rows;
+        decider.Temperature = temperature;
+        var sw = Stopwatch.StartNew();
+        IReadOnlyList<ReasonedDecision> results = await decider.DecideAsync(items).ConfigureAwait(false);
+        double seconds = sw.Elapsed.TotalSeconds;
+
+        using TextWriter writer = output is null ? Console.Out : new StreamWriter(output, append: false);
+        int correct = 0, scored = 0;
+        for (int i = 0; i < records.Count; i++)
+        {
+            DecisionResult d = results[i].Decision;
+            string? expected = records[i]["expected"]?.ToString();
+            bool? ok = expected is null ? null : d.Label == expected;
+            if (ok is not null) { scored++; if (ok.Value) correct++; }
+            var probs = new JsonObject();
+            for (int k = 0; k < d.Labels.Count; k++) probs[d.Labels[k]] = d.Probabilities[k];
+            writer.WriteLine(new JsonObject
+            {
+                ["id"] = records[i]["id"]?.ToString(),
+                ["qtype"] = records[i]["question"]!["type"]!.ToString(),
+                ["labels"] = new JsonArray([.. d.Labels.Select(l => (JsonNode)l)]),
+                ["probs"] = probs,
+                ["margins"] = new JsonArray([.. d.Margins.Select(m => (JsonNode)m)]),
+                ["predicted"] = d.Label,
+                ["expected"] = expected,
+                ["correct"] = ok,
+                ["think_tokens"] = results[i].ThinkTokens,
+                ["finished_thinking"] = results[i].FinishedThinking,
+                ["reasoning"] = results[i].Reasoning,
+                ["latency_s"] = seconds / records.Count,
+            }.ToJsonString());
+        }
+        if (scored > 0) Console.Error.WriteLine($"accuracy {correct}/{scored} = {(double)correct / scored:F3}, {seconds / records.Count:F1}s/item");
+        return 0;
+    }
+
     private static IEnumerable<string> ReadStdin()
     {
         while (Console.In.ReadLine() is { } line) yield return line;

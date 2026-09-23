@@ -29,6 +29,7 @@ internal static class Program
                 "download" => await Download(args[1..]).ConfigureAwait(false),
                 "verdict" => await Verdict(args[1..]).ConfigureAwait(false),
                 "decide" => await Decide.Run(args[1..]).ConfigureAwait(false),
+                "reason" => await Decide.Reason(args[1..]).ConfigureAwait(false),
                 "inspect" => Inspect(args[1..]),
                 "tokenize" => Tokenize(args[1..]),
                 "dump" => await Dump(args[1..]).ConfigureAwait(false),
@@ -68,6 +69,9 @@ internal static class Program
           decide   <model.gguf> --tasks FILE.jsonl | --serve [--out FILE.jsonl] [--temps FILE.json]
                    [--layout shared|per-option] [--limit N] [--threads N]
                                                          typed decisions, JevBench-format JSONL
+          reason   <reasoning.gguf> --system SYSTEM_PROMPT.txt --tasks FILE.jsonl [--out FILE.jsonl]
+                   [--max-think N] [--rows N] [--temperature T] [--limit N] [--threads N]
+                                                         reason, then decide (Ministral-3 reasoning checkpoints)
           download [q5_1|q5_0|q4_0] [--to PATH]          fetch the base checkpoint (resumable)
           verdict  <model.gguf> --instruct TEXT --query TEXT --document TEXT [--json]
                                 [--document-file PATH] [--no-prefix-cache] [--prefix-cache PATH]
