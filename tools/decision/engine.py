@@ -12,8 +12,9 @@ PREFIX_CHUNK = 1024
 
 class Decider:
     def __init__(self, model, layout="docfirst", style="listed", temperature=None, max_state_tokens=None,
-                 noul="contrast"):
+                 noul="contrast", query="full"):
         self.noul = noul
+        self.query = query
         self.m = model
         self.layout = layout
         self.style = style
@@ -62,7 +63,7 @@ class Decider:
         prefix, query, document, verdict is contiguous, as in the model card's layout.
         Everything but the document and the N verdict tokens is fixed per question, and cacheable.
         """
-        (prefix, queries, doc), _, kind = build_reads(q, labels, self.clip(state), "qcache", self.style, self.noul)
+        (prefix, queries, doc), _, kind = build_reads(q, labels, self.clip(state), "qcache", self.style, self.noul, self.query)
         p = self.m.encode(prefix, bos=True)
         qs = [self.m.encode(x) for x in queries]
         d = self.m.encode(doc)
@@ -105,7 +106,7 @@ class Decider:
         """Yes-minus-no log-odds for each read of this decision, and the read kind."""
         if self.layout == "qcache":
             return self.margins_qcache(q, labels, state, grad_from)
-        prefix, suffixes, kind = build_reads(q, labels, self.clip(state), self.layout, self.style, self.noul)
+        prefix, suffixes, kind = build_reads(q, labels, self.clip(state), self.layout, self.style, self.noul, self.query)
         past = self.run_prefix(self.encode_prefix(prefix), grad_from)
         sfx = [self.m.encode(s) for s in suffixes]
         h = self.run_suffixes(past, sfx, grad_from)

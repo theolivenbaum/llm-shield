@@ -53,7 +53,7 @@ def option_lines(qtype: str, labels: list[str], criteria) -> list[tuple[str, str
 
 
 def build_reads(q: dict, labels: list[str], state, layout: str = "docfirst", style: str = "listed",
-                noul: str = "contrast"):
+                noul: str = "contrast", query: str = "full"):
     """
     Returns (prefix, suffixes, kind). `kind` says how to turn the verdicts into probabilities:
     "binary" (one read, noul) or "softmax" (one read per label, in label order).
@@ -92,8 +92,13 @@ def build_reads(q: dict, labels: list[str], state, layout: str = "docfirst", sty
                 instruct += f"\n- {noun} {lab}: {desc}" if desc else f"\n- {noun} {lab}"
         queries = []
         for lab, desc in opts:
-            d = f" ({desc})" if desc else ""
-            queries.append(f"Is {noun} {lab}{d} the correct answer to the question?")
+            if query == "short":
+                # The criterion is already listed once in the (cached) instruction; the per-option
+                # branch, the only per-option work, names the option and nothing else.
+                queries.append(f"Is {noun} {lab} correct?")
+            else:
+                d = f" ({desc})" if desc else ""
+                queries.append(f"Is {noun} {lab}{d} the correct answer to the question?")
         kind = "softmax"
 
     if layout == "qcache":

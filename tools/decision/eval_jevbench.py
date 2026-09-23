@@ -132,6 +132,7 @@ def main():
     ap.add_argument("--layout", default="docfirst", choices=["docfirst", "card", "qcache"])
     ap.add_argument("--style", default="listed", choices=["listed", "bare"])
     ap.add_argument("--noul", default="contrast", choices=["contrast", "direct"])
+    ap.add_argument("--query", default="full", choices=["full", "short"])
     ap.add_argument("--tiers", default="easy,original,hard")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--max-state-tokens", type=int, default=0)
@@ -159,7 +160,7 @@ def main():
     if lora_state:
         m.load_state_dict(lora_state, strict=False)
     d = Decider(m, layout=a.layout, style=a.style, max_state_tokens=a.max_state_tokens or None,
-                noul=a.noul)
+                noul=a.noul, query=a.query)
 
     done = set()
     if os.path.exists(a.out):
