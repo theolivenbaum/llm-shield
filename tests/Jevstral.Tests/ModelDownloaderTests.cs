@@ -236,4 +236,50 @@ public sealed class ModelDownloaderTests : IDisposable
     [Fact]
     public void RejectsAQuantizationThatIsNotPublished()
         => Assert.Throws<ArgumentOutOfRangeException>(() => ModelDownloader.UrlFor((ShieldstralQuantization)99));
+
+    [Fact]
+    public async Task AMatchingChecksumKeepsTheFile()
+    {
+        byte[] payload = Payload(64 * 1024);
+        using var server = new TestFileServer(payload);
+        string sha = Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(payload));
+
+        await ModelDownloader.DownloadFileAsync(server.Url, Destination, expectedSha256: sha.ToUpperInvariant());
+
+        Assert.Equal(payload, await File.ReadAllBytesAsync(Destination));
+    }
+
+    /// <summary>
+    /// The resume checks catch a republished file, not a bad byte inside one. A mismatch must leave
+    /// nothing behind — neither at the destination nor as a partial file the next run would resume.
+    /// </summary>
+    [Fact]
+    public async Task AChecksumMismatchDeletesTheDownload()
+    {
+        using var server = new TestFileServer(Payload(64 * 1024));
+
+        var error = await Assert.ThrowsAsync<InvalidDataException>(
+            () => ModelDownloader.DownloadFileAsync(server.Url, Destination, expectedSha256: new string('0', 64)));
+
+        Assert.Contains("re-download", error.Message, StringComparison.Ordinal);
+        Assert.False(File.Exists(Destination));
+        Assert.False(File.Exists(Partial));
+        Assert.False(File.Exists(Metadata));
+    }
+
+    [Theory]
+    [InlineData(JevstralModel.Decider, JevstralQuantization.Q8_0, "Jevstral-1.0-3B-Q8_0.gguf")]
+    [InlineData(JevstralModel.Decider, JevstralQuantization.Q5_1, "Jevstral-1.0-3B-Q5_1.gguf")]
+    [InlineData(JevstralModel.Decider, JevstralQuantization.Q4_0, "Jevstral-1.0-3B-Q4_0.gguf")]
+    [InlineData(JevstralModel.Reasoning, JevstralQuantization.Q8_0, "Ministral-3-3B-Reasoning-Q8_0.gguf")]
+    [InlineData(JevstralModel.Reasoning, JevstralQuantization.Q5_1, "Ministral-3-3B-Reasoning-Q5_1.gguf")]
+    [InlineData(JevstralModel.Reasoning, JevstralQuantization.Q4_0, "Ministral-3-3B-Reasoning-Q4_0.gguf")]
+    public void EveryPublishedJevstralFileHasItsChecksum(JevstralModel model, JevstralQuantization quantization, string expected)
+    {
+        if (Environment.GetEnvironmentVariable("JEVSTRAL_MODEL_BASE_URL") is { Length: > 0 }) return;
+        Assert.Equal(expected, JevstralModels.FileNameFor(model, quantization));
+        Assert.Equal("https://models.curiosity.ai/jevstral/" + expected, JevstralModels.UrlFor(model, quantization));
+        Assert.Matches("^[0-9a-f]{64}$", JevstralModels.Sha256For(expected));
+        Assert.Matches("^[0-9a-f]{64}$", JevstralModels.Sha256For(JevstralModels.ReasoningSystemPromptFile));
+    }
 }

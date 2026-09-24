@@ -113,11 +113,18 @@ public static class ModelDownloader
     /// transfer left by an earlier call or an earlier process. Returns immediately when the
     /// destination already exists.
     /// </summary>
+    /// <param name="expectedSha256">
+    /// The published SHA-256 (hex). When given, the finished transfer is hashed before it is
+    /// renamed into place, and one that does not match is deleted rather than kept: the resume
+    /// checks catch a republished file, not a corrupted byte in the middle of one, and a GGUF
+    /// with a flipped weight loads, runs and is quietly wrong.
+    /// </param>
     public static async Task DownloadFileAsync(
         string url,
         string localPath,
         Action<DownloadProgress>? reportProgress = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        string? expectedSha256 = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(url);
         ArgumentException.ThrowIfNullOrWhiteSpace(localPath);
@@ -151,6 +158,7 @@ public static class ModelDownloader
             if (totalBytes is long complete && resumeFrom == complete)
             {
                 // The last run wrote every byte and was interrupted before the rename.
+                await VerifyAsync(tempPath, metaPath, fileName, expectedSha256, cancellationToken).ConfigureAwait(false);
                 Finish(tempPath, localPath, metaPath);
                 Report(complete);
                 return;
@@ -258,6 +266,7 @@ public static class ModelDownloader
                 }
             }
 
+            await VerifyAsync(tempPath, metaPath, fileName, expectedSha256, cancellationToken).ConfigureAwait(false);
             Finish(tempPath, localPath, metaPath);
         }
         finally
@@ -378,6 +387,33 @@ public static class ModelDownloader
         {
             // Losing the sidecar costs a restart from zero next time, not correctness.
         }
+    }
+
+    /// <summary>
+    /// Hashes a finished transfer against its published checksum. A mismatch deletes the partial
+    /// file and its metadata, so the next attempt starts from zero instead of resuming into the
+    /// same bad bytes.
+    /// </summary>
+    private static async Task VerifyAsync(
+        string tempPath, string metaPath, string fileName, string? expectedSha256, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(expectedSha256)) return;
+
+        string actual;
+        FileStream stream = new(tempPath, FileMode.Open, FileAccess.Read, FileShare.Read, BufferBytes, useAsync: true);
+        await using (stream.ConfigureAwait(false))
+        {
+            actual = Convert.ToHexStringLower(
+                await System.Security.Cryptography.SHA256.HashDataAsync(stream, cancellationToken).ConfigureAwait(false));
+        }
+        if (string.Equals(actual, expectedSha256.Trim(), StringComparison.OrdinalIgnoreCase)) return;
+
+        Delete(tempPath);
+        Delete(metaPath);
+        throw new InvalidDataException(
+            $"The download of '{fileName}' does not match its published SHA-256 (expected {expectedSha256.Trim()}, " +
+            $"got {actual}) and was deleted. Run again to re-download it; if it fails the same way, the file on the " +
+            "server and its checksum disagree.");
     }
 
     /// <summary>Renames the finished download into place and clears the resume bookkeeping.</summary>
