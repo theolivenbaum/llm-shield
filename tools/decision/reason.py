@@ -123,7 +123,7 @@ def reason_batch(m, prompts, max_think, end_think, eos, answer_ids):
     out = [[] for _ in range(B)]
     done = torch.zeros(B, dtype=torch.bool)
     for step in range(max_think):
-        logits = m.full_logits(h)
+        logits = m.full_logits(h, fast=True)
         nxt = logits.argmax(-1)
         for b in range(B):
             if done[b]:
@@ -138,6 +138,122 @@ def reason_batch(m, prompts, max_think, end_think, eos, answer_ids):
         h = batch.step(feed[:, None])
         batch.mark(~done)
     return out
+
+
+class Stream:
+    """
+    Continuous batching: rows share one KV tensor but keep their own lengths and positions, and a
+    finished row's slot is refilled with the next item at once. A plain batch waits for its slowest
+    row, and with a 4,096-token budget one long thinker held fifteen finished rows idle for
+    thousands of steps. Decode is bound by streaming the weights, so a step costs about the same
+    whether 3 rows or 16 are live: keeping them all live is where the throughput is.
+    """
+
+    def __init__(self, m: Shieldstral, rows: int, cap: int):
+        self.m, self.rows, self.cap = m, rows, cap
+        self.k = [torch.zeros(rows, m.n_kv, cap, m.hd, dtype=torch.bfloat16) for _ in m.layers]
+        self.v = [torch.zeros(rows, m.n_kv, cap, m.hd, dtype=torch.bfloat16) for _ in m.layers]
+        self.len = torch.zeros(rows, dtype=torch.long)
+
+    @torch.no_grad()
+    def prefill(self, r: int, ids: list[int], chunk: int = 128) -> torch.Tensor:
+        """Writes one row's prompt into slot r; returns the hidden state after its last token."""
+        m = self.m
+        s, h_last = 0, None
+        x = torch.tensor([ids])
+        while s < x.shape[1]:
+            t = x[:, s:s + chunk]
+            T = t.shape[1]
+            pos = torch.arange(s, s + T)[None]
+            mask = torch.ones(T, s + T, dtype=torch.bool).tril(s)[None, None]
+            h = m.embed[t]
+            for l, layer in enumerate(m.layers):
+                a = rmsnorm(h, layer.attn_norm, m.eps)
+                q = layer.wq(a).view(1, T, m.n_heads, m.hd).transpose(1, 2)
+                k = layer.wk(a).view(1, T, m.n_kv, m.hd).transpose(1, 2)
+                v = layer.wv(a).view(1, T, m.n_kv, m.hd).transpose(1, 2)
+                q, k = m.rope(q, pos), m.rope(k, pos)
+                self.k[l][r:r + 1, :, s:s + T] = k
+                self.v[l][r:r + 1, :, s:s + T] = v
+                o = F.scaled_dot_product_attention(q, self.k[l][r:r + 1, :, :s + T], self.v[l][r:r + 1, :, :s + T],
+                                                   attn_mask=mask, enable_gqa=True)
+                h = h + layer.wo(o.transpose(1, 2).reshape(1, T, -1))
+                f = rmsnorm(h, layer.ffn_norm, m.eps)
+                h = h + layer.w2(F.silu(layer.w1(f)) * layer.w3(f))
+            h_last = h[:, -1]
+            s += T
+        self.len[r] = len(ids)
+        return h_last[0]
+
+    @torch.no_grad()
+    def step(self, tokens: torch.Tensor, live: torch.Tensor) -> torch.Tensor:
+        """One token per row (ignored for rows that are not live); returns [rows, dim] hidden states."""
+        m, R = self.m, self.rows
+        pos = self.len.clone()
+        span = int(pos.max()) + 1
+        keys = torch.arange(span)[None] <= pos[:, None]
+        mask = keys[:, None, None, :]
+        h = m.embed[tokens[:, None]]
+        idx = torch.arange(R)
+        for l, layer in enumerate(m.layers):
+            a = rmsnorm(h, layer.attn_norm, m.eps)
+            q = layer.wq(a).view(R, 1, m.n_heads, m.hd).transpose(1, 2)
+            k = layer.wk(a).view(R, 1, m.n_kv, m.hd).transpose(1, 2)
+            v = layer.wv(a).view(R, 1, m.n_kv, m.hd).transpose(1, 2)
+            q, k = m.rope(q, pos[:, None]), m.rope(k, pos[:, None])
+            self.k[l][idx, :, pos] = k[:, :, 0]
+            self.v[l][idx, :, pos] = v[:, :, 0]
+            o = F.scaled_dot_product_attention(q, self.k[l][:, :, :span], self.v[l][:, :, :span],
+                                               attn_mask=mask, enable_gqa=True)
+            h = h + layer.wo(o.transpose(1, 2).reshape(R, 1, -1))
+            f = rmsnorm(h, layer.ffn_norm, m.eps)
+            h = h + layer.w2(F.silu(layer.w1(f)) * layer.w3(f))
+        self.len += live.long()
+        return h[:, -1]
+
+
+def reason_stream(m, prompts: list[list[int]], max_think: int, end_think: int, eos: int, rows: int, on_done,
+                  on_start=None):
+    """Greedy reasoning for every prompt, refilling rows as they finish. on_done(i, generated) per item."""
+    cap = max(len(p) for p in prompts) + max_think + 8
+    st = Stream(m, min(rows, len(prompts)), cap)
+    R = st.rows
+    queue = list(range(len(prompts)))
+    owner = [-1] * R
+    out = [[] for _ in range(R)]
+    nxt = torch.zeros(R, dtype=torch.long)
+
+    def load(r):
+        i = queue.pop(0)
+        owner[r], out[r] = i, []
+        if on_start:
+            on_start(i)
+        h = st.prefill(r, prompts[i])
+        nxt[r] = m.full_logits(h[None], fast=True)[0].argmax()
+
+    for r in range(R):
+        if queue:
+            load(r)
+    while any(o >= 0 for o in owner):
+        for r in range(R):
+            # Each row's pending token is recorded before it is fed. A row that finishes is refilled
+            # at once, and the new item's first token goes through the same check: it may itself
+            # close the thinking. Refilling without recording it shifted every later item by one.
+            while owner[r] >= 0:
+                t = int(nxt[r])
+                out[r].append(t)
+                if t in (end_think, eos) or len(out[r]) >= max_think:
+                    on_done(owner[r], out[r])
+                    owner[r] = -1
+                    if queue:
+                        load(r)
+                    continue
+                break
+        live = torch.tensor([o >= 0 for o in owner])
+        if not bool(live.any()):
+            break
+        h = st.step(torch.where(live, nxt, torch.full_like(nxt, PAD)), live)
+        nxt = torch.where(live, m.full_logits(h, fast=True).argmax(-1), nxt)
 
 
 def text_of(m, ids):
@@ -226,38 +342,43 @@ def main():
     tasks.sort(key=lambda x: len(state_text(x[1].state)))
 
     with open(a.out, "a") as f:
-        batches, cur = [], []
-        for x in tasks:
-            n = (len(m.encode(render(x[1].question, x[1].labels, x[1].state, system), bos=True)) + a.max_think
-                 + len(resume.get(x[1].id, [])))
-            if cur and (len(cur) >= a.batch or (len(cur) + 1) * max(n, cur_max) > a.kv_tokens):
-                batches.append(cur)
-                cur = []
-            cur_max = max(n, cur_max) if cur else n
-            cur.append(x)
-        if cur:
-            batches.append(cur)
         import ctypes
         import gc
         libc = ctypes.CDLL("libc.so.6")
-        for chunk in batches:
+
+        items = []
+        for tier, t in tasks:
+            labels = ["no", "yes"] if t.question["type"] == "noul" else t.labels
+            prompt = m.encode(render(t.question, labels, t.state, system) + "[THINK]", bos=True)
+            prior = [x for x in resume.get(t.id, []) if x != end_think]
+            items.append((tier, t, labels, prompt, prior))
+        items.sort(key=lambda x: len(x[3]) + len(x[4]))
+
+        # Pools of similar length, each with its own per-row capacity: short items get many rows,
+        # long policies fewer, and the KV cache stays under --kv-tokens either way.
+        pools, cur = [], []
+        for x in items:
+            cur.append(x)
+            cap = max(len(y[3]) + len(y[4]) for y in cur) + a.max_think + 8
+            rows = max(1, min(a.batch, a.kv_tokens // cap))
+            if len(cur) >= 3 * rows:
+                pools.append(cur)
+                cur = []
+        if cur:
+            pools.append(cur)
+
+        for pool in pools:
             gc.collect()
             libc.malloc_trim(0)
-            t0 = time.time()
-            prompts, labs = [], []
-            for tier, t in chunk:
-                labels = ["no", "yes"] if t.question["type"] == "noul" else t.labels
-                labs.append(labels)
-                prompts.append(m.encode(render(t.question, labels, t.state, system) + "[THINK]", bos=True)
-                               + [x for x in resume.get(t.id, []) if x != end_think])
-            gens = reason_batch(m, prompts, a.max_think, end_think, eos, None)
-            gen_s = time.time() - t0
-            for (tier, t), labels, p, g in zip(chunk, labs, prompts, gens):
-                prior = [x for x in resume.get(t.id, []) if x != end_think]
-                if prior:
-                    p = p[:len(p) - len(prior)]
-                    g = prior + g
-                g = [x for x in g if x != eos]
+            cap = max(len(y[3]) + len(y[4]) for y in pool) + a.max_think + 8
+            rows = max(1, min(a.batch, a.kv_tokens // cap))
+            started = {}
+            t_pool = time.time()
+
+            def finish(i, gen, pool=pool):
+                tier, t, labels, p, prior = pool[i]
+                g = prior + [x for x in gen if x != eos]
+                closed = end_think in gen
                 if end_think not in g:
                     g = g + [end_think]
                 think_end = g.index(end_think) + 1
@@ -273,16 +394,21 @@ def main():
                 else:
                     tp = to_task_probs(t, probs)
                     res = score_task(tp, t)
+                took = time.time() - started.get(i, t_pool)
                 rec = {"id": t.id, "tier": tier, "family": t.family, "qtype": t.question["type"], "labels": labels,
                        "mode": "reason", "probs": tp, "margins": sc, "expected": t.expected,
-                       "correct": res["correct"], **({"target": t.target} if a.syn else {}), "think_tokens": think_end, "closed": end_think in gens[chunk.index((tier, t))],
-                       "reasoning": text_of(m, g[:think_end]), "gen_ids": g[:think_end],
-                       "latency_s": gen_s / len(chunk)}
+                       "correct": res["correct"], **({"target": t.target} if a.syn else {}),
+                       "think_tokens": think_end, "closed": closed, "prompt_tokens": len(p),
+                       "new_think_tokens": len(gen), "rows": rows,
+                       "reasoning": text_of(m, g[:think_end]), "gen_ids": g[:think_end], "latency_s": took}
                 f.write(json.dumps(rec) + "\n")
                 f.flush()
                 print(f"{t.id:40s} {'OK ' if res['correct'] else 'bad'} pred={res['predicted']} exp={t.expected} "
-                      f"think={think_end} {gen_s / len(chunk):.0f}s/item", flush=True)
+                      f"think={think_end} rows={rows} {took:.0f}s", flush=True)
 
+            prompts = [x[3] + x[4] for x in pool]
+            reason_stream(m, prompts, a.max_think, end_think, eos, rows, finish,
+                          on_start=lambda i: started.__setitem__(i, time.time()))
 
 if __name__ == "__main__":
     main()

@@ -69,10 +69,14 @@ internal static class Program
           decide   <model.gguf> --tasks FILE.jsonl | --serve [--out FILE.jsonl] [--temps FILE.json]
                    [--layout shared|per-option] [--limit N] [--threads N]
                                                          typed decisions, JevBench-format JSONL
-          reason   <reasoning.gguf> --system SYSTEM_PROMPT.txt --tasks FILE.jsonl [--out FILE.jsonl]
+          reason   <reasoning.gguf> --tasks FILE.jsonl [--system SYSTEM_PROMPT.txt] [--out FILE.jsonl]
                    [--max-think N] [--rows N] [--temperature T] [--limit N] [--threads N]
                                                          reason, then decide (Ministral-3 reasoning checkpoints)
-          download [q5_1|q5_0|q4_0] [--to PATH]          fetch the base checkpoint (resumable)
+          download [decider|reasoning|all] [q8_0|q5_1|q4_0] [--to DIR]
+                                                         fetch Jevstral models from models.curiosity.ai
+                                                         (resumable, SHA-256 checked; reasoning brings its
+                                                         system prompt). Default: decider q8_0
+          download base [q5_1|q5_0|q4_0] [--to PATH]     the unadapted Shieldstral checkpoint
           verdict  <model.gguf> --instruct TEXT --query TEXT --document TEXT [--json]
                                 [--document-file PATH] [--no-prefix-cache] [--prefix-cache PATH]
                                 [--threads N]
@@ -87,6 +91,53 @@ internal static class Program
     // ------------------------------------------------------------- download
 
     private static async Task<int> Download(string[] args)
+    {
+        // `jev download base [q5_1|q5_0|q4_0] [--to PATH]`: the unadapted Shieldstral checkpoint.
+        if (args.Length > 0 && args[0].Equals("base", StringComparison.OrdinalIgnoreCase)) return await DownloadBase(args[1..]).ConfigureAwait(false);
+
+        var models = new List<JevstralModel> { JevstralModel.Decider };
+        var quantization = JevstralQuantization.Q8_0;
+        string? directory = null;
+        for (int i = 0; i < args.Length; i++)
+        {
+            string a = args[i];
+            if (a == "--to") directory = Next(args, ref i);
+            else if (a.Equals("all", StringComparison.OrdinalIgnoreCase)) models = [JevstralModel.Decider, JevstralModel.Reasoning];
+            else if (Enum.TryParse(a, ignoreCase: true, out JevstralModel m)) models = [m];
+            else if (!Enum.TryParse(a, ignoreCase: true, out quantization))
+            {
+                Console.Error.WriteLine(
+                    $"error: unexpected '{a}' — expected decider, reasoning, all or base, and one of " +
+                    string.Join(", ", Enum.GetNames<JevstralQuantization>()));
+                return 2;
+            }
+        }
+
+        foreach (JevstralModel model in models)
+        {
+            string name = JevstralModels.FileNameFor(model, quantization);
+            string path = directory is null ? JevstralModels.DefaultPathFor(name) : Path.Combine(directory, name);
+            if (File.Exists(path))
+            {
+                Console.Error.WriteLine($"{path} is already there ({new FileInfo(path).Length / (1024.0 * 1024 * 1024):F2} GiB)");
+            }
+            else
+            {
+                Console.Error.WriteLine($"{JevstralModels.UrlFor(model, quantization)}\n  -> {path}");
+                await JevstralModels.EnsureAsync(model, quantization, path, DownloadProgressPrinter()).ConfigureAwait(false);
+                Console.Error.WriteLine(JevstralModels.Sha256For(name) is null ? "  (mirror: no published checksum to verify)" : "  SHA-256 verified");
+            }
+            Console.WriteLine(path);
+            if (model == JevstralModel.Reasoning)
+            {
+                await JevstralModels.EnsureReasoningSystemPromptAsync(path).ConfigureAwait(false);
+                Console.WriteLine(JevstralModels.SystemPromptPathFor(path));
+            }
+        }
+        return 0;
+    }
+
+    private static async Task<int> DownloadBase(string[] args)
     {
         var quantization = ShieldstralQuantization.Q5_1;
         string? destination = null;
@@ -115,27 +166,28 @@ internal static class Program
         }
 
         Console.Error.WriteLine($"{ModelDownloader.UrlFor(quantization)}\n  -> {path}");
-        bool tty = !Console.IsOutputRedirected;
-        long lastLine = -1;
-
-        await ModelDownloader.EnsureModelAsync(quantization, path, Progress).ConfigureAwait(false);
-
-        if (tty) Console.Error.WriteLine();
+        await ModelDownloader.EnsureModelAsync(quantization, path, DownloadProgressPrinter()).ConfigureAwait(false);
         Console.WriteLine(path);
         return 0;
+    }
 
-        void Progress(DownloadProgress p)
+    private static Action<DownloadProgress> DownloadProgressPrinter()
+    {
+        // Without a terminal the carriage return would produce one enormous line
+        // in a log file, so redirected output gets a line every 5%.
+        bool tty = !Console.IsErrorRedirected;
+        long lastLine = -1;
+        return p =>
         {
-            // Without a terminal the carriage return would produce one enormous line
-            // in a log file, so redirected output gets a line every 5%.
             long bucket = tty ? 0 : (long)(p.Fraction * 20);
             if (!tty && bucket == lastLine) return;
             lastLine = bucket;
 
             string total = p.TotalBytes is long t ? $" / {t / (1024.0 * 1024 * 1024):F2} GiB" : string.Empty;
             string line = $"  {p.DownloadedBytes / (1024.0 * 1024 * 1024):F2} GiB{total}  {p.Fraction:P1}";
-            Console.Error.Write(tty ? $"\r{line}   " : line + "\n");
-        }
+            bool last = p.TotalBytes is long all && p.DownloadedBytes >= all;
+            Console.Error.Write(tty ? $"\r{line}   " + (last ? "\n" : "") : line + "\n");
+        };
     }
 
     // -------------------------------------------------------------- verdict

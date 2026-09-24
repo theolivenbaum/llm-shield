@@ -99,7 +99,11 @@ tag still match the server, because resuming into a republished model yields a
 GGUF of exactly the right length that is wrong from the resume point on — which no
 loader can detect. models.curiosity.ai answers HEAD with 405, so the size, the
 tag and range support all come from a one-byte ranged GET; drop that fallback and
-nothing fails, downloads just silently stop resuming.
+nothing fails, downloads just silently stop resuming. The resume checks catch a
+republished file, not a bad byte inside one, so the Jevstral files are also hashed
+against `JevstralModels.PublishedSha256` before the rename, and a mismatch deletes
+the partial file instead of leaving it to be resumed. Rebuilding the models changes
+those checksums; update the table with the new `SHA256SUMS` when you publish.
 → `ModelDownloaderTests`, against a loopback socket rather than the real host
 
 **A token's result must not depend on the batch around it.** The prefix cache and

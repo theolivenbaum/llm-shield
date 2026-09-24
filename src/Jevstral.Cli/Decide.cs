@@ -123,7 +123,15 @@ internal static class Decide
                 default: Console.Error.WriteLine($"error: unexpected argument '{args[i]}'"); return 2;
             }
         }
-        if (tasks is null || system is null) { Console.Error.WriteLine("error: --tasks and --system are required"); return 2; }
+        // `jev download reasoning` puts the system prompt next to the model.
+        system ??= File.Exists(JevstralModels.SystemPromptPathFor(model)) ? JevstralModels.SystemPromptPathFor(model) : null;
+        if (tasks is null) { Console.Error.WriteLine("error: --tasks is required"); return 2; }
+        if (system is null)
+        {
+            Console.Error.WriteLine($"error: no --system given and no {JevstralModels.ReasoningSystemPromptFile} next to the model; " +
+                                    "`jev download reasoning` fetches both");
+            return 2;
+        }
 
         var records = File.ReadLines(tasks).Where(l => !string.IsNullOrWhiteSpace(l)).Select(l => JsonNode.Parse(l)!).ToList();
         if (limit > 0) records = records.Take(limit).ToList();

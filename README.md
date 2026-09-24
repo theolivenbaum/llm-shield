@@ -91,7 +91,9 @@ dotnet run --project src/Jevstral.Cli -c Release -- decide  model.gguf --tasks t
 dotnet run --project src/Jevstral.Cli -c Release -- decide  model.gguf --serve   # JSONL on stdin/stdout
 dotnet run --project src/Jevstral.Cli -c Release -- verdict model.gguf --instruct … --query … --document …
 dotnet run --project src/Jevstral.Cli -c Release -- bench   model.gguf [--threads N]
-dotnet run --project src/Jevstral.Cli -c Release -- download q5_1                 # the base checkpoint
+dotnet run --project src/Jevstral.Cli -c Release -- download all q8_0 --to ~/jevstral   # both models + system prompt
+dotnet run --project src/Jevstral.Cli -c Release -- reason  ~/jevstral/Ministral-3-3B-Reasoning-Q8_0.gguf --tasks tasks.jsonl
+dotnet run --project src/Jevstral.Cli -c Release -- download base q5_1            # the unadapted Shieldstral checkpoint
 ```
 
 `decide` reads JevBench-format records: `{"id", "state", "question": {"type", "instructions",
@@ -108,7 +110,13 @@ A Jevstral deployment is two GGUFs:
 | `Ministral-3-3B-Reasoning-<Q>.gguf` (+ `.SYSTEM_PROMPT.txt`) | Mistral's reasoning checkpoint, unchanged | `ReasoningDecider`, `jev reason` |
 
 `JevstralDecider.CreateAsync()` and `ReasoningDecider.CreateAsync()` download them from
-`https://models.curiosity.ai/jevstral/` (override with `JEVSTRAL_MODEL_BASE_URL`) and cache them.
+`https://models.curiosity.ai/jevstral/` (override with `JEVSTRAL_MODEL_BASE_URL`) and cache them;
+`jev download [decider|reasoning|all] [q8_0|q5_1|q4_0] [--to DIR]` does the same from the command
+line. Downloads resume after an interruption, and each file is hashed against the published
+`SHA256SUMS` (carried in `JevstralModels.PublishedSha256`) before it is renamed into place. A
+mismatch deletes the download rather than keeping it. `jev reason` finds the system prompt next
+to the model, where `download reasoning` puts it.
+
 To build them:
 
 ```bash
@@ -120,7 +128,9 @@ The script fetches both public checkpoints from Hugging Face, folds `adapters/je
 LoRA, 11.4M parameters in fp16, committed here) into Shieldstral, converts both models, and
 writes `SHA256SUMS`. It needs no PyTorch and no GPU. It does need about 15 GiB of disk for the
 downloads plus the outputs, and about 6 GB of RAM. With the .NET SDK installed, it also
-smoke-tests one decision. Upload the contents of the output directory as they are.
+smoke-tests one decision. Upload the contents of the output directory as they are. The build is
+reproducible: an independent Q8_0 build matches the published checksums bit for bit, so a
+rebuild that changes them changes `JevstralModels.PublishedSha256` too.
 
 Every GGUF type is readable:
 
