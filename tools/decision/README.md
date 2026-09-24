@@ -22,6 +22,11 @@ training possible here.
 | `fit_temps.py` | per-type temperature, fitted on non-JevBench held-out data |
 | `merge_lora_to_gguf.py` | folds an adapter into a GGUF for the C# runtime |
 | `jevbench_adapter.py` | a JevBench adapter (`jevstral_local`) for either backend, plus a runner |
+| `reason.py` | reason, then decide: Ministral-3-3B-Reasoning thinks, then every label is scored after "Final answer:" (continuous batching, resumable) |
+| `fit_ensemble.py` | softmax(s/T + w·z) over reasoning label scores and verdict log-odds, fitted on synthetic items only |
+| `budget_study.py` | accuracy at every thinking budget below the one a run used, from its saved token ids |
+| `speed_reason.py` | prefill, decode (per sequence and aggregate, by row count) and label scoring, in tokens/s |
+| `run_reasoning_eval.sh` | all of the reasoning evaluation in order, resumable |
 
 ## How a typed decision becomes Shieldstral reads
 
@@ -82,6 +87,42 @@ python3 tools/decision/train_lora.py --data td:~/models/td/train.parquet@300 syn
 # C# runtime: merge and run
 python3 tools/decision/merge_lora_to_gguf.py ~/models/shieldstral ~/models/lora_v1.pt --outfile ~/models/decision-q8_0.gguf
 dotnet run --project src/Jevstral.Cli -c Release -- decide ~/models/decision-q8_0.gguf --tasks tasks.jsonl
+```
+
+## Reason, then decide
+
+The verdict decider reads one token per option. That token cannot compute a date window or chain
+three rules, which is most of the hard tier. `mistralai/Ministral-3-3B-Reasoning-2512` has the same
+architecture and tokenizer, so the same runtime runs it (`ReasoningDecider`, `jev reason`). It
+thinks greedily up to a budget, then each label is scored as the continuation of "Final answer:".
+
+Public JevBench, measured on a 4-core VM before the runs were moved to a bigger machine:
+
+| | easy | standard | hard |
+|---|---|---|---|
+| verdict decider, v1 adapter (docfirst) | 0.979 | 0.819 | 0.423 |
+| reasoning, 4096-token budget (easy/std), 1536 (hard) | 1.000 | 0.931 | 0.640 |
+| reasoning, hard: the 50 items cut off at 1536 continued to 2560 | | | **0.667** |
+
+- **The hard tier is budget-bound.** At 1536 tokens only 30% of hard items closed their
+  thinking. `temporal_numeric` (0.27) and `long_policy` (0.42), the weakest families, almost never
+  did. Continuing the cut-off items to 2560 tokens took them from 23 to 26 correct.
+- **The two paths fail on different items.** Reasoning is weak on routing (0.667 on standard,
+  where the verdict decider has 1.0). On hard, 0.748 of items are right under one path or the
+  other: roughly the ceiling for `fit_ensemble.py`.
+- **Synthetic calibration items (150, seed 99):** reasoning at 4096 gets 0.90 (routing 0.75).
+- Latency at these budgets is minutes per item on 4 cores: a batch of 3–6 rows took 60–1900 s.
+  `speed_reason.py` breaks that down.
+
+Still to run (`run_reasoning_eval.sh` does all of it, in order):
+1. hard at the full 4096-token budget for every item;
+2. the verdict decider on the synthetic items, then the ensemble fit, applied to JevBench;
+3. the budget study (low / medium / high = 512 / 1536 / 4096 and every point between);
+4. tokens/s for torch and for `jev reason`.
+
+```bash
+MODELS=~/models JEVBENCH=~/jevbench THREADS=32 KV_TOKENS=120000 BATCH=32 \
+    tools/decision/run_reasoning_eval.sh ~/runs/reasoning
 ```
 
 ## Contamination
